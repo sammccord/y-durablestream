@@ -61,7 +61,7 @@ const SYNC_STEP_2 = 1;
  * ```ts
  * import { DurableObject } from "cloudflare:workers";
  * import { Doc } from "yjs";
- * import { YStreamClient } from "y-stream";
+ * import { YStreamClient } from "y-durablestream";
  *
  * export class MyDO extends DurableObject<Env> {
  *   private doc = new Doc();
@@ -84,6 +84,13 @@ export class YStreamClient {
 
 	private _status: YStreamClientStatus = "disconnected";
 	private _synced = false;
+
+	/**
+	 * Set to `true` by {@link disconnect} to signal that the client
+	 * should stop.  Checked by {@link connect} after async operations
+	 * to detect a disconnect that happened during setup.
+	 */
+	private _disposed = false;
 
 	/** Registered doc 'update' handler, stored so it can be removed. */
 	private updateHandler: ((update: Uint8Array, origin: unknown) => void) | null =
@@ -141,10 +148,10 @@ export class YStreamClient {
 	/**
 	 * Connect to the upstream provider and start synchronising.
 	 *
-	 * The returned `Promise` resolves when the stream ends (either
-	 * because the provider closed it, a network error occurred, or
-	 * {@link disconnect} was called).  In a Durable Object you would
-	 * typically wrap this in `ctx.waitUntil()`.
+	 * The returned `Promise` **always resolves** (never rejects) so it
+	 * is safe to pass directly to `ctx.waitUntil()`.  It resolves when
+	 * the stream ends — either because the provider closed it, a
+	 * network error occurred, or {@link disconnect} was called.
 	 *
 	 * Calling `connect()` while already connected is a no-op — it
 	 * returns immediately without error.
@@ -154,14 +161,22 @@ export class YStreamClient {
 			return;
 		}
 
+		this._disposed = false;
 		this.setStatus("connecting");
 
 		let stream: ReadableStream<Uint8Array>;
 		try {
 			stream = await this.stub.subscribe();
-		} catch (err) {
+		} catch {
 			this.setStatus("disconnected");
-			throw err;
+			return;
+		}
+
+		// If disconnect() was called while we were awaiting subscribe(),
+		// abort immediately without entering the read loop.
+		if (this._disposed) {
+			this.teardown();
+			return;
 		}
 
 		this.setStatus("connected");
@@ -184,14 +199,28 @@ export class YStreamClient {
 		this.sendSyncStep1();
 
 		// Enter the read loop — this runs until the stream ends or we
-		// disconnect.  Errors are handled inside readLoop() so this
-		// will not reject.
+		// disconnect.  readLoop() always resolves (never rejects).
 		await this.readLoop();
+
+		// Clean up resources after the read loop exits.
+		// This is the ONLY place teardown is called during an active
+		// connection — disconnect() deliberately does NOT call it,
+		// avoiding the double-cleanup race that causes unhandled
+		// rejections.
 		this.teardown();
 	}
 
 	/**
-	 * Disconnect from the upstream provider and clean up all resources.
+	 * Disconnect from the upstream provider.
+	 *
+	 * Cancels the underlying `ReadableStream` reader, which causes the
+	 * read loop inside {@link connect} to exit.  The `connect()` method
+	 * then calls {@link teardown} to release all resources.
+	 *
+	 * This method intentionally does **not** call `teardown()` itself —
+	 * doing so would race with `connect()`'s teardown and create
+	 * duplicate `reader.cancel()` / `reader.releaseLock()` calls that
+	 * surface as unhandled promise rejections in the workerd runtime.
 	 *
 	 * Safe to call multiple times or when not connected.
 	 */
@@ -200,21 +229,18 @@ export class YStreamClient {
 			return;
 		}
 
-		// Cancel the reader which will cause the read loop to exit.
-		// The cancel() promise may reject if the stream is already
-		// closed or errored — swallow it to avoid unhandled rejections.
-		if (this.reader) {
-			try {
-				this.reader.cancel().catch(() => {});
-			} catch {
-				// Reader may already be released.
-			}
-		}
+		// Signal that the client is shutting down.  This is checked by
+		// connect() after async operations to detect a disconnect that
+		// happened during setup (before readLoop starts).
+		this._disposed = true;
 
-		// teardown() will be called by the finally block in connect(),
-		// but if disconnect() is called from outside (not via the read
-		// loop exiting), we call it explicitly.
-		this.teardown();
+		// Cancel the reader to unblock the read loop.  The returned
+		// promise rejection (if any) is swallowed — the read loop's
+		// .then(_, onRejected) handler will observe the cancellation
+		// and exit cleanly, after which connect() calls teardown().
+		if (this.reader) {
+			this.reader.cancel().catch(() => {});
+		}
 	}
 
 	// ═════════════════════════════════════
@@ -225,28 +251,43 @@ export class YStreamClient {
 	 * Continuously read from the stream, decode frames, and process
 	 * each complete Yjs sync protocol message.
 	 *
-	 * Gracefully handles stream cancellation (e.g. from
-	 * {@link disconnect}) so that it never surfaces as an unhandled
-	 * rejection.
+	 * Uses `.then(onFulfilled, onRejected)` instead of `try/catch` on
+	 * `await` so that the rejection handler is attached **synchronously**
+	 * at the moment `reader.read()` is called.  This prevents the
+	 * workerd runtime from observing a transiently "unhandled" rejection
+	 * in the microtask gap between when the promise rejects and when an
+	 * async `catch` block would run.
+	 *
+	 * Always resolves — never rejects.
 	 */
 	private async readLoop(): Promise<void> {
 		const reader = this.reader;
 		const decoder = this.decoder;
 		if (!reader || !decoder) return;
 
-		try {
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
+		let active = true;
 
-				const messages = decoder.push(value);
-				for (const msg of messages) {
-					this.handleMessage(msg);
-				}
-			}
-		} catch {
-			// Stream was cancelled or the network connection was lost.
-			// Both are expected during disconnect — nothing to propagate.
+		while (active) {
+			// Attach both handlers synchronously via .then() so the
+			// rejection handler is registered before the next microtask.
+			await reader.read().then(
+				({ done, value }) => {
+					if (done) {
+						active = false;
+						return;
+					}
+
+					const messages = decoder.push(value);
+					for (const msg of messages) {
+						this.handleMessage(msg);
+					}
+				},
+				() => {
+					// Stream was cancelled (disconnect) or the network
+					// connection was lost.  Exit the loop cleanly.
+					active = false;
+				},
+			);
 		}
 	}
 
@@ -254,7 +295,7 @@ export class YStreamClient {
 	 * Process a single complete Yjs sync protocol message received from
 	 * the upstream provider.
 	 *
-	 * @param data A complete Yjs sync protocol message (the payload
+	 * @param data - A complete Yjs sync protocol message (the payload
 	 *   inside a length-prefixed frame, without the frame header).
 	 */
 	private handleMessage(data: Uint8Array): void {
@@ -325,7 +366,14 @@ export class YStreamClient {
 	// ═════════════════════════════════════
 
 	/**
-	 * Clean up all resources.  Idempotent — safe to call repeatedly.
+	 * Release all resources.  Called exclusively by {@link connect}
+	 * after the read loop exits — never by {@link disconnect}.
+	 *
+	 * Does **not** cancel the reader (that is disconnect's job).
+	 * Only cleans up references so the client can be reconnected or
+	 * garbage-collected.
+	 *
+	 * Idempotent — safe to call repeatedly.
 	 */
 	private teardown(): void {
 		if (this.updateHandler) {
@@ -334,18 +382,10 @@ export class YStreamClient {
 		}
 
 		if (this.reader) {
-			// Attempt to cancel any pending read before releasing.
-			// Swallow errors since the reader/stream may already be
-			// closed or cancelled by disconnect().
-			try {
-				this.reader.cancel().catch(() => {});
-			} catch {
-				/* noop */
-			}
 			try {
 				this.reader.releaseLock();
 			} catch {
-				/* noop */
+				// Reader may already be released or the stream errored.
 			}
 			this.reader = null;
 		}

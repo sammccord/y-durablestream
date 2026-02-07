@@ -254,16 +254,21 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * Runs asynchronously after {@link subscribe} returns so that
 	 * the `ReadableStream` has crossed the RPC boundary and the
 	 * caller has had a chance to attach a reader.
+	 *
+	 * Uses `.then(_, onRejected)` to attach the rejection handler
+	 * synchronously, preventing a transiently "unhandled" rejection
+	 * in the workerd runtime.
 	 */
 	private async sendInitialSync(
 		session: StreamSession,
 		frame: Uint8Array,
 	): Promise<void> {
-		try {
-			await session.writer.write(frame);
-		} catch {
-			this.removeSession(session);
-		}
+		await session.writer.write(frame).then(
+			() => {},
+			() => {
+				this.removeSession(session);
+			},
+		);
 	}
 
 	/**
@@ -333,6 +338,10 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * Write a length-framed sync Update message to every active
 	 * subscriber stream.  Sessions whose writers have errored are
 	 * removed automatically.
+	 *
+	 * Uses `.then(_, onRejected)` to attach rejection handlers
+	 * synchronously, preventing transiently "unhandled" rejections
+	 * in the workerd runtime.
 	 */
 	private broadcastUpdate(update: Uint8Array): void {
 		if (this.sessions.size === 0) return;
@@ -340,24 +349,36 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		const frame = encodeFrame(createSyncUpdateMessage(update));
 
 		for (const session of this.sessions) {
-			session.writer.write(frame).catch(() => {
-				this.removeSession(session);
-			});
+			session.writer.write(frame).then(
+				() => {},
+				() => {
+					this.removeSession(session);
+				},
+			);
 		}
 	}
 
 	/**
 	 * Tear down a subscriber session and release its resources.
 	 * When the last session is removed, storage is compacted.
+	 *
+	 * Avoids calling `writer.close()` because the writer may already
+	 * be in an errored state (e.g. the subscriber disconnected), and
+	 * closing an errored writer creates a secondary promise rejection
+	 * that surfaces as "Network connection lost" in the workerd
+	 * runtime.  Instead we simply release the writer lock — the
+	 * underlying stream will be garbage-collected.
 	 */
 	private removeSession(session: StreamSession): void {
+		if (!this.sessions.has(session)) return;
+
 		session.unsubscribe();
 		this.sessions.delete(session);
 
 		try {
-			session.writer.close().catch(() => {});
+			session.writer.releaseLock();
 		} catch {
-			// Writer may already be closed or errored.
+			// Writer may already be released.
 		}
 
 		// Compact storage when the last subscriber disconnects.
