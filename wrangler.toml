@@ -1,0 +1,25 @@
+name = "y-stream-test"
+main = "test/worker.ts"
+compatibility_date = "2026-02-05"
+compatibility_flags = ["nodejs_compat"]
+
+[[durable_objects.bindings]]
+name = "Y_STREAM_PROVIDER"
+class_name = "TestProvider"
+
+[[durable_objects.bindings]]
+name = "Y_STREAM_SUBSCRIBER"
+class_name = "TestSubscriber"
+
+[[durable_objects.bindings]]
+name = "Y_SQL_PROVIDER"
+class_name = "TestSqlProvider"
+
+[[durable_objects.bindings]]
+name = "Y_SQL_SUBSCRIBER"
+class_name = "TestSqlSubscriber"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TestProvider", "TestSqlProvider"]
+new_classes = ["TestSubscriber", "TestSqlSubscriber"]

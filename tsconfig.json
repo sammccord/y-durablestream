@@ -1,0 +1,30 @@
+{
+	"compilerOptions": {
+		"target": "ESNext",
+		"module": "ESNext",
+		"moduleResolution": "Bundler",
+		"esModuleInterop": true,
+		"strict": true,
+		"lib": [
+			"ESNext"
+		],
+		"types": [
+			"@cloudflare/vitest-pool-workers",
+			"vitest/globals"
+		],
+		"noEmit": true,
+		"skipLibCheck": true,
+		"skipDefaultLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"isolatedModules": true,
+		"resolveJsonModule": true
+	},
+	"include": [
+		"src",
+		"test"
+	],
+	"exclude": [
+		"node_modules",
+		"dist"
+	]
+}
