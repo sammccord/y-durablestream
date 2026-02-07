@@ -1,6 +1,6 @@
 {
 	"name": "y-durablestream",
-	"version": "0.0.1",
+	"version": "0.1.0",
 	"description": "Yjs document synchronization between Cloudflare Durable Objects via TransformStream with pluggable storage backends",
 	"type": "module",
 	"main": "dist/index.cjs",
