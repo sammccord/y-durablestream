@@ -136,6 +136,9 @@ declare class ReadableStream<R = unknown> {
 	tee(): [ReadableStream<R>, ReadableStream<R>];
 	cancel(reason?: unknown): Promise<void>;
 	readonly locked: boolean;
+
+	/** Async iteration support (available in workerd runtime). */
+	[Symbol.asyncIterator](): AsyncIterableIterator<R>;
 }
 
 declare class ReadableStreamDefaultReader<R = unknown> {

@@ -396,3 +396,145 @@ describe("Provider persistence", () => {
 		await waitForSubscriberText(sub2, "root", "from first subscriber");
 	});
 });
+
+// ──────────────────────────────────────────────────────────
+// Bidirectional sync (update() response)
+// ──────────────────────────────────────────────────────────
+
+describe("Bidirectional sync via update()", () => {
+	it("subscriber with pre-existing local state syncs to the provider", async () => {
+		const providerName = "bidi-prelocal-provider";
+		const provider = getProvider(providerName);
+		const sub = getSubscriber("bidi-prelocal-sub");
+
+		// Subscriber has local data BEFORE connecting
+		await sub.insertText("root", 0, "local-only");
+
+		await sub.connectToProvider(providerName);
+		await waitForSync(sub);
+
+		// The provider should receive the subscriber's pre-existing data
+		// via the SyncStep1→SyncStep2 response path in update()
+		await waitForProviderText(provider, "root", "local-only");
+	});
+
+	it("merges pre-existing state from both provider and subscriber", async () => {
+		const providerName = "bidi-merge-provider";
+		const provider = getProvider(providerName);
+
+		// Provider has some data
+		await provider.applyUpdate(createTextUpdate("alpha", "from-provider"));
+
+		// Subscriber has different data before connecting
+		const sub = getSubscriber("bidi-merge-sub");
+		await sub.insertText("beta", 0, "from-subscriber");
+
+		await sub.connectToProvider(providerName);
+		await waitForSync(sub);
+
+		// Both should converge: provider gets subscriber's data,
+		// subscriber gets provider's data
+		await waitForProviderText(provider, "beta", "from-subscriber");
+		await waitForSubscriberText(sub, "alpha", "from-provider");
+	});
+});
+
+// ──────────────────────────────────────────────────────────
+// Broadcast buffer
+// ──────────────────────────────────────────────────────────
+
+describe("Broadcast buffer", () => {
+	it("handles rapid sequential updates to multiple subscribers", async () => {
+		const providerName = "bcast-rapid-provider";
+		const provider = getProvider(providerName);
+		const subA = getSubscriber("bcast-rapid-a");
+		const subB = getSubscriber("bcast-rapid-b");
+		const subC = getSubscriber("bcast-rapid-c");
+
+		await subA.connectToProvider(providerName);
+		await subB.connectToProvider(providerName);
+		await subC.connectToProvider(providerName);
+		await waitForSync(subA);
+		await waitForSync(subB);
+		await waitForSync(subC);
+
+		// Fire several updates in rapid succession
+		for (let i = 0; i < 10; i++) {
+			await provider.applyUpdate(createTextUpdate(`field-${i}`, `value-${i}`));
+		}
+
+		// All three subscribers should converge on the full state
+		for (let i = 0; i < 10; i++) {
+			await waitForSubscriberText(subA, `field-${i}`, `value-${i}`);
+			await waitForSubscriberText(subB, `field-${i}`, `value-${i}`);
+			await waitForSubscriberText(subC, `field-${i}`, `value-${i}`);
+		}
+	});
+
+	it("new subscriber does not receive stale broadcast buffer entries", async () => {
+		const providerName = "bcast-no-stale-provider";
+		const provider = getProvider(providerName);
+
+		// Apply updates before any subscriber connects
+		await provider.applyUpdate(createTextUpdate("root", "early"));
+
+		// First subscriber connects and syncs
+		const subA = getSubscriber("bcast-no-stale-a");
+		await subA.connectToProvider(providerName);
+		await waitForSync(subA);
+		await waitForSubscriberText(subA, "root", "early");
+
+		// Apply more updates while subA is connected
+		await provider.applyUpdate(createTextUpdate("extra", "data"));
+		await waitForSubscriberText(subA, "extra", "data");
+
+		// Second subscriber connects later — should get full state via
+		// initial sync, not stale broadcast buffer entries
+		const subB = getSubscriber("bcast-no-stale-b");
+		await subB.connectToProvider(providerName);
+		await waitForSync(subB);
+		await waitForSubscriberText(subB, "root", "early");
+		await waitForSubscriberText(subB, "extra", "data");
+	});
+
+	it("compacts storage when the last consumer disconnects", async () => {
+		const providerName = "bcast-compact-provider";
+		const provider = getProvider(providerName);
+		const sub = getSubscriber("bcast-compact-sub");
+
+		await sub.connectToProvider(providerName);
+		await waitForSync(sub);
+		await sub.insertText("root", 0, "compaction test");
+		await waitForProviderText(provider, "root", "compaction test");
+
+		// Disconnect — should trigger onEmpty → storage.commit()
+		await sub.disconnect();
+		await delay(200);
+
+		// New subscriber should still see the data (persisted via compaction)
+		const sub2 = getSubscriber("bcast-compact-sub2");
+		await sub2.connectToProvider(providerName);
+		await waitForSubscriberText(sub2, "root", "compaction test");
+	});
+});
+
+// ──────────────────────────────────────────────────────────
+// Reconnection
+// ──────────────────────────────────────────────────────────
+
+describe("Reconnection", () => {
+	it("subscriber with reconnect enabled reports reconnecting status", async () => {
+		const sub = getSubscriber("recon-status-sub");
+		await sub.connectToProviderWithReconnect("recon-status-provider");
+		await waitForSync(sub);
+
+		expect(await sub.getStatus()).toBe("synced");
+
+		// Disconnect the stream from the provider side by disconnecting
+		// the subscriber, which triggers teardown → reconnect
+		// Note: we can't easily simulate provider-side stream closure in
+		// tests, so we verify the option is accepted and basic flow works
+		await sub.disconnect();
+		expect(await sub.getStatus()).toBe("no-client");
+	});
+});

@@ -2,17 +2,20 @@
  * # y-durablestream
  *
  * Yjs document synchronization between Cloudflare Durable Objects via
- * `TransformStream`.
+ * a shared broadcast buffer and pull-based `ReadableStream`.
  *
  * This package provides two core primitives:
  *
  * - **{@link YStreamProvider}** — A Durable Object that hosts an
  *   authoritative Yjs document and streams updates to subscribers via
- *   `ReadableStream`.
+ *   `ReadableStream`.  Uses an internal broadcast buffer with
+ *   configurable {@link BackpressurePolicy} so slow subscribers are
+ *   handled explicitly rather than silently failing.
  *
  * - **{@link YStreamClient}** — A client that synchronises a local
  *   `Y.Doc` with an upstream provider, sending local changes back via
- *   direct RPC calls.
+ *   direct RPC calls.  Supports optional automatic reconnection with
+ *   exponential backoff.
  *
  * Two pluggable storage backends are included:
  *
@@ -27,14 +30,21 @@
  * ```ts
  * // Provider — extend and deploy as a Durable Object
  * import { YStreamProvider } from "y-durablestream";
- * export class DocProvider extends YStreamProvider<Env> {}
+ * export class DocProvider extends YStreamProvider<Env> {
+ *   constructor(ctx: DurableObjectState, env: Env) {
+ *     super(ctx, env, { backpressure: "drop-oldest", streamHighWaterMark: 128 });
+ *   }
+ * }
  *
  * // Subscriber — connect from any other Durable Object
  * import { YStreamClient } from "y-durablestream";
  * import { Doc } from "yjs";
  *
  * const doc = new Doc();
- * const client = new YStreamClient(doc, { stub });
+ * const client = new YStreamClient(doc, {
+ *   stub,
+ *   reconnect: { maxRetries: 10, initialDelay: 200 },
+ * });
  * ctx.waitUntil(client.connect());
  * ```
  *
@@ -53,10 +63,11 @@ export {
 } from "./storage";
 export type { YDocStorage, YDocStorageOptions } from "./storage";
 export type {
+	BackpressurePolicy,
+	ReconnectOptions,
 	YStreamProviderStub,
 	YStreamClientOptions,
 	YStreamClientStatus,
 	YStreamProviderOptions,
 	StatusChangeHandler,
-	StreamSession,
 } from "./types";

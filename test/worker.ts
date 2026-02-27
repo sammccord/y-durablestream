@@ -48,6 +48,17 @@ export class TestSubscriber extends DurableObject<Env> {
 		this.ctx.waitUntil(this.client.connect());
 	}
 
+	async connectToProviderWithReconnect(providerName: string): Promise<void> {
+		const stub = this.env.Y_STREAM_PROVIDER.get(
+			this.env.Y_STREAM_PROVIDER.idFromName(providerName),
+		);
+		this.client = new YStreamClient(this.doc, {
+			stub,
+			reconnect: { maxRetries: 3, initialDelay: 100 },
+		});
+		this.ctx.waitUntil(this.client.connect());
+	}
+
 	async getDocState(): Promise<Uint8Array> {
 		return encodeStateAsUpdate(this.doc);
 	}

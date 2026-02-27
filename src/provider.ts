@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { createDecoder, readVarUint } from "lib0/decoding";
 import {
 	createEncoder,
+	length,
 	toUint8Array,
 	writeVarUint,
 } from "lib0/encoding";
@@ -13,11 +14,13 @@ import {
 } from "y-protocols/sync";
 import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
 
+import { BroadcastBuffer } from "./broadcast";
 import { encodeFrame, encodeFrames } from "./protocol";
 import { DurableObjectKvStorage } from "./storage/kv";
 
+
 import type { YDocStorage } from "./storage/types";
-import type { StreamSession } from "./types";
+import type { YStreamProviderOptions } from "./types";
 
 /** Yjs sync protocol outer message type identifier. */
 const MESSAGE_SYNC = 0;
@@ -121,8 +124,13 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	/** The pluggable storage backend for persistence. */
 	protected storage: YDocStorage;
 
-	/** Active subscriber stream sessions. */
-	private sessions = new Set<StreamSession>();
+	/**
+	 * Shared broadcast buffer that distributes framed updates to
+	 * all active subscriber streams.  Replaces the per-session
+	 * `TransformStream` + `WritableStreamDefaultWriter` model
+	 * with a single shared buffer and per-consumer cursors.
+	 */
+	private broadcast!: BroadcastBuffer;
 
 	// ═════════════════════════════════════
 	// Configurable thresholds
@@ -149,9 +157,18 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 */
 	protected maxUpdates = 500;
 
-	constructor(ctx: DurableObjectState, env: E) {
+	constructor(ctx: DurableObjectState, env: E, options?: YStreamProviderOptions) {
 		super(ctx, env);
-		this.doc = new Doc({ gc: true });
+		if (options?.maxBytes !== undefined) this.maxBytes = options.maxBytes;
+		if (options?.maxUpdates !== undefined) this.maxUpdates = options.maxUpdates;
+		this.broadcast = new BroadcastBuffer({
+			highWaterMark: options?.streamHighWaterMark ?? 64,
+			backpressure: options?.backpressure ?? "drop-oldest",
+			onEmpty: () => {
+				void this.storage.commit(this.doc);
+			},
+		});
+		this.doc = new Doc({ gc: options?.gc ?? true });
 		this.storage = this.createStorage();
 		void this.ctx.blockConcurrencyWhile(() => this.onStart());
 	}
@@ -221,54 +238,21 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 *   sync Update messages.
 	 */
 	async subscribe(): Promise<ReadableStream<Uint8Array>> {
-		const { readable, writable } = new TransformStream<
-			Uint8Array,
-			Uint8Array
-		>();
-		const writer = writable.getWriter();
+		// Build the per-subscriber initial sync burst: SyncStep1 + SyncStep2.
+		// These are delivered as the consumer's `initialFrames` so they are
+		// drained before the consumer starts reading from the shared
+		// broadcast buffer.  This avoids the timing issue of writing data
+		// to a TransformStream before the readable side crosses the RPC
+		// boundary.
+		const initialFrames = [
+			encodeFrames([
+				createSyncStep1Message(this.doc),
+				createSyncStep2Message(this.doc),
+			]),
+		];
 
-		const session: StreamSession = {
-			writer,
-			unsubscribe: () => {},
-		};
-		this.sessions.add(session);
-
-		// Build the initial sync burst: SyncStep1 + SyncStep2.
-		// IMPORTANT: We must NOT write data to the stream before returning
-		// the ReadableStream.  Data buffered in a TransformStream before
-		// the readable side crosses the RPC boundary may be lost.  Instead
-		// we schedule the write to execute after this method returns so the
-		// caller has attached a reader first.
-		const initialFrame = encodeFrames([
-			createSyncStep1Message(this.doc),
-			createSyncStep2Message(this.doc),
-		]);
-
-		void this.sendInitialSync(session, initialFrame);
-
-		return readable;
-	}
-
-	/**
-	 * Write the initial sync burst to a newly registered session.
-	 * Runs asynchronously after {@link subscribe} returns so that
-	 * the `ReadableStream` has crossed the RPC boundary and the
-	 * caller has had a chance to attach a reader.
-	 *
-	 * Uses `.then(_, onRejected)` to attach the rejection handler
-	 * synchronously, preventing a transiently "unhandled" rejection
-	 * in the workerd runtime.
-	 */
-	private async sendInitialSync(
-		session: StreamSession,
-		frame: Uint8Array,
-	): Promise<void> {
-		await session.writer.write(frame).then(
-			() => {},
-			() => {
-				this.removeSession(session);
-			},
-		);
+		const consumer = this.broadcast.createConsumer(initialFrames);
+		return consumer.readable;
 	}
 
 	/**
@@ -286,7 +270,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 *
 	 * @param data A complete Yjs sync protocol message (not length-framed).
 	 */
-	async update(data: Uint8Array): Promise<void> {
+	async update(data: Uint8Array): Promise<Uint8Array | void> {
 		const decoder = createDecoder(data);
 		const encoder = createEncoder();
 		const msgType = readVarUint(decoder);
@@ -294,6 +278,12 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		if (msgType === MESSAGE_SYNC) {
 			writeVarUint(encoder, MESSAGE_SYNC);
 			readSyncMessage(decoder, encoder, this.doc, "y-stream-remote");
+
+			// If readSyncMessage produced a response (e.g. a SyncStep2 reply
+			// to a client's SyncStep1), return it so the caller can process it.
+			if (length(encoder) > 1) {
+				return toUint8Array(encoder);
+			}
 		}
 	}
 
@@ -335,55 +325,17 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	}
 
 	/**
-	 * Write a length-framed sync Update message to every active
-	 * subscriber stream.  Sessions whose writers have errored are
-	 * removed automatically.
+	 * Push a length-framed sync Update message into the broadcast
+	 * buffer where it will be pulled by every active consumer on
+	 * their next read.
 	 *
-	 * Uses `.then(_, onRejected)` to attach rejection handlers
-	 * synchronously, preventing transiently "unhandled" rejections
-	 * in the workerd runtime.
+	 * The broadcast buffer applies the configured backpressure
+	 * policy to slow consumers automatically.
 	 */
 	private broadcastUpdate(update: Uint8Array): void {
-		if (this.sessions.size === 0) return;
+		if (this.broadcast.consumerCount === 0) return;
 
 		const frame = encodeFrame(createSyncUpdateMessage(update));
-
-		for (const session of this.sessions) {
-			session.writer.write(frame).then(
-				() => {},
-				() => {
-					this.removeSession(session);
-				},
-			);
-		}
-	}
-
-	/**
-	 * Tear down a subscriber session and release its resources.
-	 * When the last session is removed, storage is compacted.
-	 *
-	 * Avoids calling `writer.close()` because the writer may already
-	 * be in an errored state (e.g. the subscriber disconnected), and
-	 * closing an errored writer creates a secondary promise rejection
-	 * that surfaces as "Network connection lost" in the workerd
-	 * runtime.  Instead we simply release the writer lock — the
-	 * underlying stream will be garbage-collected.
-	 */
-	private removeSession(session: StreamSession): void {
-		if (!this.sessions.has(session)) return;
-
-		session.unsubscribe();
-		this.sessions.delete(session);
-
-		try {
-			session.writer.releaseLock();
-		} catch {
-			// Writer may already be released.
-		}
-
-		// Compact storage when the last subscriber disconnects.
-		if (this.sessions.size === 0) {
-			void this.storage.commit(this.doc);
-		}
+		this.broadcast.push(frame);
 	}
 }
