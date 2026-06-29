@@ -11,7 +11,18 @@
  */
 
 const HEADER_SIZE = 4;
-const MAX_FRAME_SIZE = 1024 * 1024; // 1MB safety limit
+
+/**
+ * Default per-frame payload cap. This is a safety guard against a malformed or
+ * hostile length header making the decoder allocate unbounded memory — **not** a
+ * yjs or Durable Object limit. The full-document initial sync (`SyncStep2`) is a
+ * single frame, so this caps the largest syncable document. Trusted DO-to-DO
+ * deployments that sync large documents can raise it per-decoder via
+ * {@link createFrameDecoder}'s `maxFrameSize` option.
+ *
+ * @default 1048576 (1 MB)
+ */
+export const DEFAULT_MAX_FRAME_SIZE = 1024 * 1024;
 
 /**
  * Encode a message into a length-prefixed frame.
@@ -76,8 +87,11 @@ export function encodeFrames(messages: Uint8Array[]): Uint8Array {
  *   }
  * }
  * ```
+ *
+ * @param options - Optional decoder configuration (see {@link FrameDecoderOptions}).
  */
-export function createFrameDecoder(): FrameDecoder {
+export function createFrameDecoder(options?: FrameDecoderOptions): FrameDecoder {
+	const maxFrameSize = options?.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE;
 	let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
 	// Read position into `buffer`.  Consumed frames advance `offset`
 	// instead of reallocating the buffer, so decoding N frames from one
@@ -111,9 +125,9 @@ export function createFrameDecoder(): FrameDecoder {
 			);
 			const payloadLength = view.getUint32(0, false);
 
-			if (payloadLength > MAX_FRAME_SIZE) {
+			if (payloadLength > maxFrameSize) {
 				throw new FrameDecodeError(
-					`Frame payload length ${payloadLength} exceeds maximum of ${MAX_FRAME_SIZE} bytes`
+					`Frame payload length ${payloadLength} exceeds maximum of ${maxFrameSize} bytes`
 				);
 			}
 
@@ -141,6 +155,20 @@ export function createFrameDecoder(): FrameDecoder {
 	}
 
 	return { push, reset, bufferedBytes };
+}
+
+/**
+ * Options for {@link createFrameDecoder}.
+ */
+export interface FrameDecoderOptions {
+	/**
+	 * Maximum decodable frame payload, in bytes. Frames larger than this throw
+	 * a {@link FrameDecodeError}. Raise it to sync documents whose full-state
+	 * `SyncStep2` exceeds the {@link DEFAULT_MAX_FRAME_SIZE} default.
+	 *
+	 * @default {@link DEFAULT_MAX_FRAME_SIZE} (1 MB)
+	 */
+	maxFrameSize?: number;
 }
 
 /**

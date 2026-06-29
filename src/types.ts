@@ -81,6 +81,15 @@ export interface YStreamClientOptions {
 	 * ends and the caller must re-invoke it manually.
 	 */
 	reconnect?: boolean | ReconnectOptions;
+
+	/**
+	 * Maximum decodable frame payload, in bytes. The full-document initial
+	 * sync arrives as a single frame, so raise this above the 1 MB default to
+	 * sync larger documents. Must be ≥ the largest frame the provider sends.
+	 *
+	 * @default 1048576 (1 MB)
+	 */
+	maxFrameSize?: number;
 }
 
 /**

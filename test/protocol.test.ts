@@ -4,6 +4,7 @@ import {
 	encodeFrame,
 	encodeFrames,
 	createFrameDecoder,
+	DEFAULT_MAX_FRAME_SIZE,
 	FrameDecodeError,
 } from "../src/protocol";
 
@@ -221,6 +222,30 @@ describe("createFrameDecoder", () => {
 		expect(() =>
 			createFrameDecoder().push(header),
 		).toThrow(/exceeds maximum/);
+	});
+
+	it("honors a custom maxFrameSize (accepts above the 1MB default, rejects beyond)", () => {
+		// A ~2MB payload: rejected by the default decoder, accepted at 4MB.
+		const payload = new Uint8Array(2 * 1024 * 1024).fill(7);
+		const frame = encodeFrame(payload);
+
+		expect(() => createFrameDecoder().push(frame)).toThrow(/exceeds maximum/);
+
+		const big = createFrameDecoder({ maxFrameSize: 4 * 1024 * 1024 });
+		const messages = big.push(frame);
+		expect(messages).toHaveLength(1);
+		expect(messages[0].byteLength).toBe(payload.byteLength);
+
+		// Still bounded: a frame beyond the custom cap throws, citing the cap.
+		const header = new Uint8Array(4);
+		new DataView(header.buffer).setUint32(0, 5 * 1024 * 1024, false);
+		expect(() => createFrameDecoder({ maxFrameSize: 4 * 1024 * 1024 }).push(header)).toThrow(
+			/4194304 bytes/,
+		);
+	});
+
+	it("DEFAULT_MAX_FRAME_SIZE is 1 MB", () => {
+		expect(DEFAULT_MAX_FRAME_SIZE).toBe(1024 * 1024);
 	});
 
 	it("reset() clears the internal buffer", () => {

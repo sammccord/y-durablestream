@@ -53,8 +53,14 @@
 
 export { YStreamProvider } from "./provider";
 export { YStreamClient } from "./client";
-export { encodeFrame, encodeFrames, createFrameDecoder, FrameDecodeError } from "./protocol";
-export type { FrameDecoder } from "./protocol";
+export {
+	encodeFrame,
+	encodeFrames,
+	createFrameDecoder,
+	FrameDecodeError,
+	DEFAULT_MAX_FRAME_SIZE,
+} from "./protocol";
+export type { FrameDecoder, FrameDecoderOptions } from "./protocol";
 export {
 	DurableObjectKvStorage,
 	DurableObjectSqlStorage,

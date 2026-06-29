@@ -124,6 +124,13 @@ export class YStreamClient {
 	private readonly reconnectOptions: Required<ReconnectOptions> | null;
 
 	/**
+	 * Maximum decodable frame size, forwarded to the frame decoder. Lets the
+	 * client accept a full-state sync larger than the 1 MB default — must match
+	 * (or exceed) the largest frame the provider sends.
+	 */
+	private readonly maxFrameSize: number | undefined;
+
+	/**
 	 * Set to `true` when a connection reaches the `"synced"` state.
 	 * Used by the reconnect loop to reset the retry counter after a
 	 * successful connection.
@@ -133,6 +140,7 @@ export class YStreamClient {
 	constructor(doc: Doc, options: YStreamClientOptions) {
 		this.doc = doc;
 		this.stub = options.stub;
+		this.maxFrameSize = options.maxFrameSize;
 		this.reconnectOptions = options.reconnect
 			? {
 					maxRetries:
@@ -377,7 +385,7 @@ export class YStreamClient {
 	 * Always resolves — never rejects.
 	 */
 	private async readLoop(stream: ReadableStream<Uint8Array>): Promise<void> {
-		const decoder = createFrameDecoder();
+		const decoder = createFrameDecoder({ maxFrameSize: this.maxFrameSize });
 		this.decoder = decoder;
 
 		try {
