@@ -32,7 +32,7 @@
  * import { YStreamProvider } from "y-durablestream";
  * export class DocProvider extends YStreamProvider<Env> {
  *   constructor(ctx: DurableObjectState, env: Env) {
- *     super(ctx, env, { backpressure: "drop-oldest", streamHighWaterMark: 128 });
+ *     super(ctx, env, { backpressure: "resync", streamHighWaterMark: 128 });
  *   }
  * }
  *

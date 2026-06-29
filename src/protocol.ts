@@ -79,23 +79,36 @@ export function encodeFrames(messages: Uint8Array[]): Uint8Array {
  */
 export function createFrameDecoder(): FrameDecoder {
 	let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+	// Read position into `buffer`.  Consumed frames advance `offset`
+	// instead of reallocating the buffer, so decoding N frames from one
+	// chunk is O(N) rather than O(N²).
+	let offset = 0;
 
 	function push(chunk: Uint8Array): Uint8Array[] {
-		// Append new chunk to existing buffer
-		if (buffer.byteLength === 0) {
+		if (offset >= buffer.byteLength) {
+			// Everything buffered so far has been consumed — adopt the
+			// new chunk directly (zero-copy fast path for whole frames).
 			buffer = chunk;
+			offset = 0;
 		} else {
-			const combined = new Uint8Array(buffer.byteLength + chunk.byteLength);
-			combined.set(buffer, 0);
-			combined.set(chunk, buffer.byteLength);
+			// Compact the unconsumed tail and append the new chunk.
+			const remaining = buffer.byteLength - offset;
+			const combined = new Uint8Array(remaining + chunk.byteLength);
+			combined.set(buffer.subarray(offset), 0);
+			combined.set(chunk, remaining);
 			buffer = combined;
+			offset = 0;
 		}
 
 		const messages: Uint8Array[] = [];
 
 		// Extract as many complete frames as possible
-		while (buffer.byteLength >= HEADER_SIZE) {
-			const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+		while (buffer.byteLength - offset >= HEADER_SIZE) {
+			const view = new DataView(
+				buffer.buffer,
+				buffer.byteOffset + offset,
+				buffer.byteLength - offset,
+			);
 			const payloadLength = view.getUint32(0, false);
 
 			if (payloadLength > MAX_FRAME_SIZE) {
@@ -105,17 +118,14 @@ export function createFrameDecoder(): FrameDecoder {
 			}
 
 			const frameSize = HEADER_SIZE + payloadLength;
-			if (buffer.byteLength < frameSize) {
+			if (buffer.byteLength - offset < frameSize) {
 				// Not enough data yet for the full frame — wait for more
 				break;
 			}
 
-			// Extract the complete message payload
-			const message = buffer.slice(HEADER_SIZE, frameSize);
-			messages.push(message);
-
-			// Advance past this frame
-			buffer = buffer.slice(frameSize);
+			// Extract the complete message payload and advance past the frame.
+			messages.push(buffer.slice(offset + HEADER_SIZE, offset + frameSize));
+			offset += frameSize;
 		}
 
 		return messages;
@@ -123,10 +133,11 @@ export function createFrameDecoder(): FrameDecoder {
 
 	function reset(): void {
 		buffer = new Uint8Array(0);
+		offset = 0;
 	}
 
 	function bufferedBytes(): number {
-		return buffer.byteLength;
+		return buffer.byteLength - offset;
 	}
 
 	return { push, reset, bufferedBytes };

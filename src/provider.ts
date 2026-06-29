@@ -25,6 +25,21 @@ import type { YStreamProviderOptions } from "./types";
 /** Yjs sync protocol outer message type identifier. */
 const MESSAGE_SYNC = 0;
 
+/**
+ * Byte length of an empty document encoded via `encodeStateAsUpdate`.
+ * A freshly created `Y.Doc` with no content encodes to exactly two
+ * bytes, so anything larger carries real persisted state worth applying.
+ */
+const EMPTY_DOC_UPDATE_BYTES = 2;
+
+/**
+ * Transaction origin used for subscriber updates that carry no client
+ * id.  Distinct from `this` (the provider) so handlers can tell remote
+ * updates apart; never matches a consumer's client id, so such updates
+ * broadcast to every subscriber.
+ */
+const REMOTE_ORIGIN = "y-stream-remote";
+
 // ═══════════════════════════════════════════════════════════
 // Sync message helpers
 // ═══════════════════════════════════════════════════════════
@@ -163,10 +178,22 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		if (options?.maxUpdates !== undefined) this.maxUpdates = options.maxUpdates;
 		this.broadcast = new BroadcastBuffer({
 			highWaterMark: options?.streamHighWaterMark ?? 64,
-			backpressure: options?.backpressure ?? "drop-oldest",
+			backpressure: options?.backpressure ?? "resync",
 			onEmpty: () => {
-				void this.storage.commit(this.doc);
+				// Compact storage once no subscribers remain.  Tie it to
+				// the DO lifetime via waitUntil so it isn't dropped if the
+				// object is evicted, and never let a storage failure surface
+				// as an unhandled rejection.
+				this.ctx.waitUntil(
+					this.storage.commit(this.doc).catch((err) => {
+						this.onStorageError(err);
+					}),
+				);
 			},
+			// Supply a fresh full-state burst so a consumer that falls
+			// behind under the "resync" policy converges without losing
+			// any deltas.
+			onResync: () => this.buildInitialFrames(),
 		});
 		this.doc = new Doc({ gc: options?.gc ?? true });
 		this.storage = this.createStorage();
@@ -214,14 +241,20 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	protected async onStart(): Promise<void> {
 		const persisted = await this.storage.getYDoc();
 		const state = encodeStateAsUpdate(persisted);
-		if (state.byteLength > 2) {
+		if (state.byteLength > EMPTY_DOC_UPDATE_BYTES) {
 			// Only apply if there is meaningful content (an empty doc
 			// encodes to a 2-byte update).
 			applyUpdate(this.doc, state);
 		}
 
-		this.doc.on("update", (update: Uint8Array) => {
-			void this.handleDocUpdate(update);
+		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
+			// `origin` is the value passed to readSyncMessage/applyUpdate.
+			// For subscriber updates it is the sender's client id, used to
+			// avoid echoing the update back to that subscriber.
+			this.handleDocUpdate(
+				update,
+				typeof origin === "string" ? origin : undefined,
+			);
 		});
 	}
 
@@ -232,27 +265,40 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	/**
 	 * Subscribe to the provider's Yjs document.
 	 *
+	 * @param clientId - Optional stable id for the subscriber.  Pass the
+	 *   same id to {@link update} so the provider can avoid echoing the
+	 *   subscriber's own changes back to it over this stream.
 	 * @returns A `ReadableStream<Uint8Array>` that delivers length-framed
 	 *   Yjs sync protocol messages.  The initial burst contains
 	 *   SyncStep1 + SyncStep2; subsequent chunks are incremental
 	 *   sync Update messages.
 	 */
-	async subscribe(): Promise<ReadableStream<Uint8Array>> {
-		// Build the per-subscriber initial sync burst: SyncStep1 + SyncStep2.
-		// These are delivered as the consumer's `initialFrames` so they are
-		// drained before the consumer starts reading from the shared
-		// broadcast buffer.  This avoids the timing issue of writing data
-		// to a TransformStream before the readable side crosses the RPC
-		// boundary.
-		const initialFrames = [
+	async subscribe(clientId?: string): Promise<ReadableStream<Uint8Array>> {
+		const consumer = this.broadcast.createConsumer(
+			this.buildInitialFrames(),
+			clientId,
+		);
+		return consumer.readable;
+	}
+
+	/**
+	 * Build the initial sync burst for a (re)connecting consumer:
+	 * SyncStep1 + SyncStep2 packed into a single framed buffer.
+	 *
+	 * Delivered as the consumer's `initialFrames` so they are drained
+	 * before it starts reading from the shared broadcast buffer.  This
+	 * avoids the timing issue of writing data to a stream before the
+	 * readable side crosses the RPC boundary, and is reused by the
+	 * broadcast buffer's `"resync"` backpressure recovery to bring a
+	 * lagging consumer back to the current document state.
+	 */
+	private buildInitialFrames(): Uint8Array[] {
+		return [
 			encodeFrames([
 				createSyncStep1Message(this.doc),
 				createSyncStep2Message(this.doc),
 			]),
 		];
-
-		const consumer = this.broadcast.createConsumer(initialFrames);
-		return consumer.readable;
 	}
 
 	/**
@@ -269,15 +315,21 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * subscribers automatically via the document's `update` event.
 	 *
 	 * @param data A complete Yjs sync protocol message (not length-framed).
+	 * @param clientId Optional id matching the one passed to
+	 *   {@link subscribe}.  When provided, the resulting change is not
+	 *   echoed back to that subscriber's own stream.
 	 */
-	async update(data: Uint8Array): Promise<Uint8Array | void> {
+	async update(
+		data: Uint8Array,
+		clientId?: string,
+	): Promise<Uint8Array | void> {
 		const decoder = createDecoder(data);
 		const encoder = createEncoder();
 		const msgType = readVarUint(decoder);
 
 		if (msgType === MESSAGE_SYNC) {
 			writeVarUint(encoder, MESSAGE_SYNC);
-			readSyncMessage(decoder, encoder, this.doc, "y-stream-remote");
+			readSyncMessage(decoder, encoder, this.doc, clientId ?? REMOTE_ORIGIN);
 
 			// If readSyncMessage produced a response (e.g. a SyncStep2 reply
 			// to a client's SyncStep1), return it so the caller can process it.
@@ -318,10 +370,37 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	// Internal: update handling
 	// ═════════════════════════════════════
 
-	/** Persist an update then broadcast it to every subscriber stream. */
-	private async handleDocUpdate(update: Uint8Array): Promise<void> {
-		await this.storage.storeUpdate(update);
-		this.broadcastUpdate(update);
+	/**
+	 * Broadcast an update to every subscriber stream, then persist it.
+	 *
+	 * Broadcast happens first and synchronously so live sync is never
+	 * blocked by (or lost to) a storage failure.  Persistence is then
+	 * tied to the DO lifetime via `waitUntil` and its errors are routed
+	 * to {@link onStorageError} rather than becoming unhandled
+	 * rejections.  If an update fails to persist, it is recovered from a
+	 * subscriber on the next SyncStep1/SyncStep2 handshake, so the only
+	 * consequence is delayed durability — never silent divergence.
+	 */
+	private handleDocUpdate(update: Uint8Array, originId?: string): void {
+		this.broadcastUpdate(update, originId);
+		this.ctx.waitUntil(
+			this.storage.storeUpdate(update).catch((err) => {
+				this.onStorageError(err);
+			}),
+		);
+	}
+
+	/**
+	 * Hook invoked when a background storage operation (persisting an
+	 * update or compacting on the last disconnect) fails.
+	 *
+	 * The default implementation logs the error.  Override in a subclass
+	 * to report to an external monitor or to take corrective action.
+	 *
+	 * @param error - The error thrown by the storage backend.
+	 */
+	protected onStorageError(error: unknown): void {
+		console.error("[y-durablestream] storage operation failed:", error);
 	}
 
 	/**
@@ -331,11 +410,14 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 *
 	 * The broadcast buffer applies the configured backpressure
 	 * policy to slow consumers automatically.
+	 *
+	 * @param originId - When set, the originating subscriber is not sent
+	 *   an echo of its own update (see {@link BroadcastBuffer.push}).
 	 */
-	private broadcastUpdate(update: Uint8Array): void {
+	private broadcastUpdate(update: Uint8Array, originId?: string): void {
 		if (this.broadcast.consumerCount === 0) return;
 
 		const frame = encodeFrame(createSyncUpdateMessage(update));
-		this.broadcast.push(frame);
+		this.broadcast.push(frame, originId);
 	}
 }

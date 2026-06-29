@@ -11,7 +11,14 @@ const STATE_DOC_KEY = "ydoc:state:doc";
 const STATE_BYTES_KEY = "ydoc:state:bytes";
 const STATE_COUNT_KEY = "ydoc:state:count";
 const UPDATE_KEY_PREFIX = "ydoc:update:";
-const updateKey = (n: number) => `${UPDATE_KEY_PREFIX}${n}`;
+/**
+ * Zero-pad the update index so that `list({ prefix })`, which returns
+ * keys in lexicographic order, yields updates in numeric insertion order
+ * (otherwise `:10` would sort before `:2`).  20 digits covers the full
+ * 64-bit range.  Yjs tolerates out-of-order application, but ordered
+ * keys keep the snapshot deterministic and debugging sane.
+ */
+const updateKey = (n: number) => `${UPDATE_KEY_PREFIX}${String(n).padStart(20, "0")}`;
 
 /**
  * Minimal subset of `DurableObjectStorage` / `DurableObjectTransaction`

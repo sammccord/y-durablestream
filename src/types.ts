@@ -8,8 +8,12 @@ export interface YStreamProviderStub {
 	/**
 	 * Subscribe to the provider's Yjs document.
 	 * Returns a ReadableStream of length-framed Yjs sync protocol messages.
+	 *
+	 * @param clientId Optional stable id for this subscriber.  Pass the
+	 *   same id to {@link update} so the provider does not echo the
+	 *   subscriber's own changes back over this stream.
 	 */
-	subscribe(): Promise<ReadableStream<Uint8Array>>;
+	subscribe(clientId?: string): Promise<ReadableStream<Uint8Array>>;
 
 	/**
 	 * Send a Yjs sync protocol message to the provider.
@@ -17,8 +21,13 @@ export interface YStreamProviderStub {
 	 *
 	 * May return a response message (e.g. a SyncStep2 in reply to a
 	 * SyncStep1) that the caller should process.
+	 *
+	 * @param data The Yjs sync protocol message.
+	 * @param clientId Optional id matching the one passed to
+	 *   {@link subscribe}, enabling the provider to suppress the echo of
+	 *   this update back to the sender.
 	 */
-	update(data: Uint8Array): Promise<Uint8Array | void>;
+	update(data: Uint8Array, clientId?: string): Promise<Uint8Array | void>;
 
 	/**
 	 * Get the full Yjs document state as a single encoded update.
@@ -93,15 +102,21 @@ export type StatusChangeHandler = (status: YStreamClientStatus) => void;
  * Backpressure policy applied to the broadcast buffer when a slow
  * subscriber falls behind the configured high-water mark.
  *
- * - `"drop-oldest"` – discard the oldest buffered frames so the slow
- *   consumer jumps ahead.  Best for real-time Yjs sync where the
- *   latest document state subsumes all previous states.
- * - `"drop-newest"` – discard the incoming frame when the buffer is
- *   full.  Suitable when every frame must eventually be consumed.
- * - `"error"` – disconnect the slowest consumer when the buffer
- *   overflows.
+ * The streamed frames after initial sync are **incremental Yjs update
+ * deltas**, not snapshots.  Silently dropping a delta would leave the
+ * subscriber permanently diverged: every later update that causally
+ * depends on the dropped one stays pending in Yjs forever and never
+ * applies.  Therefore neither policy ever discards a delta.
+ *
+ * - `"resync"` – when a consumer falls behind, deliver a fresh
+ *   full-state snapshot (a new SyncStep1 + SyncStep2 burst) and resume
+ *   it from the buffer head.  The consumer converges to the current
+ *   document state with no data loss, and the buffer is reclaimed.
+ *   This is the safe default for CRDT sync.
+ * - `"error"` – disconnect the slow consumer.  It is free to reconnect,
+ *   which performs a full resync from scratch.
  */
-export type BackpressurePolicy = "drop-oldest" | "drop-newest" | "error";
+export type BackpressurePolicy = "resync" | "error";
 
 /**
  * Options for constructing a YStreamProvider.
@@ -128,7 +143,7 @@ export interface YStreamProviderOptions {
 	/**
 	 * Backpressure policy for the broadcast buffer.
 	 * Controls what happens when a subscriber falls behind.
-	 * @default "drop-oldest"
+	 * @default "resync"
 	 */
 	backpressure?: BackpressurePolicy;
 

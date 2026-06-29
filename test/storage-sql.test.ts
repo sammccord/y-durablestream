@@ -406,9 +406,9 @@ describe("DurableObjectSqlStorage — SQL-specific behavior", () => {
 
 		await provider.applyUpdate(createTextUpdate("root", "check-tables"));
 
-		await runInDurableObject(provider, async (instance: TestSqlProvider) => {
+		await runInDurableObject(provider, async (_instance: TestSqlProvider, state) => {
 			// The SQL storage backend should have created the tables
-			const tables = instance.ctx.storage.sql
+			const tables = state.storage.sql
 				.exec<{ name: string }>(
 					"SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'yjs_%' ORDER BY name",
 				)
@@ -427,8 +427,8 @@ describe("DurableObjectSqlStorage — SQL-specific behavior", () => {
 		await provider.applyUpdate(createTextUpdate("root", "update-1"));
 		await provider.applyUpdate(createTextUpdate("field2", "update-2"));
 
-		await runInDurableObject(provider, async (instance: TestSqlProvider) => {
-			const rows = instance.ctx.storage.sql
+		await runInDurableObject(provider, async (_instance: TestSqlProvider, state) => {
+			const rows = state.storage.sql
 				.exec<{ id: number; byte_length: number }>(
 					"SELECT id, byte_length FROM yjs_updates ORDER BY id ASC",
 				)
@@ -460,16 +460,16 @@ describe("DurableObjectSqlStorage — SQL-specific behavior", () => {
 		// enough time for the DO event loop to process it.
 		await delay(500);
 
-		await runInDurableObject(provider, async (instance: TestSqlProvider) => {
+		await runInDurableObject(provider, async (_instance: TestSqlProvider, state) => {
 			// After compaction, the snapshot should exist and the
 			// updates table should be empty.  However, compaction is
 			// async (fire-and-forget), so if it hasn't run yet we
 			// verify at minimum that the data is still correct.
-			const snapshots = instance.ctx.storage.sql
+			const snapshots = state.storage.sql
 				.exec<{ id: number }>("SELECT id FROM yjs_snapshot")
 				.toArray();
 
-			const updates = instance.ctx.storage.sql
+			const updates = state.storage.sql
 				.exec<{ cnt: number }>("SELECT COUNT(*) AS cnt FROM yjs_updates")
 				.one();
 

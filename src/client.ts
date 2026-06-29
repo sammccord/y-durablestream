@@ -22,6 +22,17 @@ import type {
 const MESSAGE_SYNC = 0;
 
 /**
+ * Generate a globally unique client id.  The workerd runtime provides a
+ * standard global `crypto`; it is accessed via `globalThis` so the module
+ * does not depend on a particular ambient `crypto` type declaration.
+ */
+function generateClientId(): string {
+	return (
+		globalThis as unknown as { crypto: { randomUUID(): string } }
+	).crypto.randomUUID();
+}
+
+/**
  * y-protocols/sync messageYjsSyncStep2 constant.
  * After receiving and processing a SyncStep2, the client considers
  * itself fully synchronised with the provider.
@@ -78,6 +89,13 @@ const SYNC_STEP_2 = 1;
 export class YStreamClient {
 	private readonly doc: Doc;
 	private readonly stub: YStreamProviderStub;
+
+	/**
+	 * Stable id sent with `subscribe()` and every `update()` so the
+	 * provider can avoid echoing this client's own changes back over the
+	 * stream.
+	 */
+	private readonly clientId: string = generateClientId();
 
 	private stream: ReadableStream<Uint8Array> | null = null;
 	private decoder: ReturnType<typeof createFrameDecoder> | null = null;
@@ -204,6 +222,12 @@ export class YStreamClient {
 			return;
 		}
 
+		// Clear the disposed flag once, here — not inside connectOnce.
+		// Resetting it per-attempt created a race where a disconnect()
+		// landing between the reconnect loop's dispose check and the next
+		// connectOnce() was silently discarded.
+		this._disposed = false;
+
 		if (!this.reconnectOptions) {
 			return this.connectOnce();
 		}
@@ -254,12 +278,11 @@ export class YStreamClient {
 	 * repeatedly invoke it.  Always resolves — never rejects.
 	 */
 	private async connectOnce(): Promise<void> {
-		this._disposed = false;
 		this.setStatus("connecting");
 
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe();
+			stream = await this.stub.subscribe(this.clientId);
 		} catch {
 			this.setStatus("disconnected");
 			return;
@@ -405,7 +428,7 @@ export class YStreamClient {
 		// If processing a SyncStep1 produced a SyncStep2 response,
 		// send it back to the provider.
 		if (length(encoder) > 1) {
-			void this.stub.update(toUint8Array(encoder));
+			void this.stub.update(toUint8Array(encoder), this.clientId);
 		}
 
 		// Transition to "synced" after receiving SyncStep2.
@@ -433,7 +456,7 @@ export class YStreamClient {
 		const encoder = createEncoder();
 		writeVarUint(encoder, MESSAGE_SYNC);
 		writeSyncStep1(encoder, this.doc);
-		const response = await this.stub.update(toUint8Array(encoder));
+		const response = await this.stub.update(toUint8Array(encoder), this.clientId);
 		if (response) {
 			this.handleMessage(response);
 		}
@@ -447,7 +470,7 @@ export class YStreamClient {
 		const encoder = createEncoder();
 		writeVarUint(encoder, MESSAGE_SYNC);
 		writeUpdate(encoder, update);
-		void this.stub.update(toUint8Array(encoder));
+		void this.stub.update(toUint8Array(encoder), this.clientId);
 	}
 
 	// ═════════════════════════════════════

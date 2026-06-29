@@ -26,6 +26,12 @@ type PullResolver = () => void;
 interface ConsumerState {
 	/** Unique id for this consumer. */
 	id: number;
+	/**
+	 * Caller-supplied client id, used to skip echoing a frame back to the
+	 * consumer that originated it (see {@link BroadcastBuffer.push}).
+	 * `undefined` for consumers that never send updates.
+	 */
+	clientId: string | undefined;
 	/** Position in the shared buffer (absolute index). */
 	cursor: number;
 	/** Per-consumer initial frames (SyncStep1+2) drained before shared buffer. */
@@ -58,7 +64,7 @@ export interface BroadcastBufferOptions {
 
 	/**
 	 * What to do when a consumer falls behind.
-	 * @default "drop-oldest"
+	 * @default "resync"
 	 */
 	backpressure?: BackpressurePolicy;
 
@@ -67,6 +73,19 @@ export interface BroadcastBufferOptions {
 	 * Useful for triggering storage compaction.
 	 */
 	onEmpty?: () => void;
+
+	/**
+	 * Build a fresh full-state initial burst for a consumer that has
+	 * fallen behind under the `"resync"` policy.  Returns the frames
+	 * (typically a single SyncStep1 + SyncStep2 buffer) that bring the
+	 * consumer back to the current document state.
+	 *
+	 * Required for the `"resync"` policy to recover data correctly.  If
+	 * omitted, a lagging consumer under `"resync"` is fast-forwarded to
+	 * the buffer head **without** a snapshot, which can diverge a CRDT
+	 * subscriber — so a real provider must always supply this.
+	 */
+	onResync?: () => Uint8Array[];
 }
 
 // ─── Implementation ─────────────────────────────────────────────
@@ -87,11 +106,13 @@ export class BroadcastBuffer {
 	private readonly highWaterMark: number;
 	private readonly backpressure: BackpressurePolicy;
 	private readonly onEmpty?: () => void;
+	private readonly onResync?: () => Uint8Array[];
 
 	constructor(options?: BroadcastBufferOptions) {
 		this.highWaterMark = options?.highWaterMark ?? 64;
-		this.backpressure = options?.backpressure ?? "drop-oldest";
+		this.backpressure = options?.backpressure ?? "resync";
 		this.onEmpty = options?.onEmpty;
+		this.onResync = options?.onResync;
 	}
 
 	// ── Producer API ──────────────────────────────────────────────
@@ -103,9 +124,31 @@ export class BroadcastBuffer {
 	 * are immediately woken.  Consumers that have fallen behind the
 	 * high-water mark are handled according to the backpressure
 	 * policy.
+	 *
+	 * @param frame - The framed message to deliver.
+	 * @param originId - If set, the caught-up consumer whose `clientId`
+	 *   matches is fast-forwarded past this frame so it does not receive
+	 *   an echo of its own update.  (A consumer that has fallen behind
+	 *   still receives it; re-applying is idempotent in Yjs.)
 	 */
-	push(frame: Uint8Array): void {
+	push(frame: Uint8Array, originId?: string): void {
+		const headBefore = this.baseIndex + this.buffer.length;
 		this.buffer.push(frame);
+		const headAfter = this.baseIndex + this.buffer.length;
+
+		// Skip echoing the frame back to its originator when that consumer
+		// is fully caught up (the common case for an active editor).
+		if (originId !== undefined) {
+			for (const consumer of this.consumers.values()) {
+				if (
+					!consumer.cancelled &&
+					consumer.clientId === originId &&
+					consumer.cursor === headBefore
+				) {
+					consumer.cursor = headAfter;
+				}
+			}
+		}
 
 		// Apply backpressure per-consumer before waking them.
 		this.applyBackpressure();
@@ -125,14 +168,25 @@ export class BroadcastBuffer {
 	/**
 	 * Create a new consumer backed by a pull-based `ReadableStream`.
 	 *
-	 * The consumer first drains any `initialFrames` (the per-subscriber
-	 * SyncStep1+2 burst), then reads from the shared buffer.
+	 * The consumer first drains any `initialFrames`, then reads from the
+	 * shared buffer.
+	 *
+	 * @param initialFrames - Frames to deliver before the shared buffer.
+	 *   Each array element is enqueued as a single stream chunk, and may
+	 *   itself contain several concatenated length-prefixed frames (e.g.
+	 *   the provider packs SyncStep1 + SyncStep2 into one element).
+	 * @param clientId - Optional id identifying the consumer so its own
+	 *   updates are not echoed back to it (see {@link push}).
 	 */
-	createConsumer(initialFrames?: Uint8Array[]): BroadcastConsumer {
+	createConsumer(
+		initialFrames?: Uint8Array[],
+		clientId?: string,
+	): BroadcastConsumer {
 		const id = this.nextId++;
 
 		const state: ConsumerState = {
 			id,
+			clientId,
 			// New consumers start at the current buffer head so they
 			// don't receive historical frames (they get initial sync
 			// via `initialFrames` instead).
@@ -205,6 +259,17 @@ export class BroadcastBuffer {
 		return this.consumers.size;
 	}
 
+	/**
+	 * Number of frames currently retained in the shared buffer.
+	 *
+	 * Exposed for diagnostics and tests — under the `"resync"` and
+	 * `"error"` policies this stays bounded by the high-water mark even
+	 * when a consumer stalls.
+	 */
+	get bufferedFrameCount(): number {
+		return this.buffer.length;
+	}
+
 	// ── Internals ─────────────────────────────────────────────────
 
 	/**
@@ -242,39 +307,52 @@ export class BroadcastBuffer {
 	/**
 	 * Apply the configured backpressure policy to consumers that have
 	 * fallen behind the high-water mark.
+	 *
+	 * Neither policy ever skips an incremental delta — doing so would
+	 * permanently diverge a CRDT subscriber.  `"resync"` recovers the
+	 * consumer with a fresh full-state snapshot; `"error"` disconnects
+	 * it so it can reconnect.
 	 */
 	private applyBackpressure(): void {
+		const head = this.baseIndex + this.buffer.length;
+
+		// Collect lagging consumers first so we never mutate the
+		// `consumers` map while iterating it (the "error" policy removes
+		// entries) and never re-enter applyBackpressure via removeConsumer.
+		const lagging: ConsumerState[] = [];
 		for (const consumer of this.consumers.values()) {
 			if (consumer.cancelled) continue;
-
-			const lag = this.baseIndex + this.buffer.length - consumer.cursor;
-			if (lag <= this.highWaterMark) continue;
-
-			switch (this.backpressure) {
-				case "drop-oldest":
-					// Advance the slow consumer's cursor to keep it within
-					// the high-water mark, effectively skipping old frames.
-					consumer.cursor = this.baseIndex + this.buffer.length - this.highWaterMark;
-					break;
-
-				case "drop-newest":
-					// Nothing to do per-consumer; we simply won't enqueue
-					// data beyond the high-water mark on the next pull.
-					break;
-
-				case "error":
-					// Disconnect the slow consumer.
-					try {
-						consumer.controller?.error(
-							new Error("Subscriber too slow: backpressure overflow"),
-						);
-					} catch {
-						// Already errored — ignore.
-					}
-					this.removeConsumer(consumer.id);
-					break;
-			}
+			if (head - consumer.cursor <= this.highWaterMark) continue;
+			lagging.push(consumer);
 		}
+
+		if (lagging.length === 0) return;
+
+		for (const consumer of lagging) {
+			if (this.backpressure === "error") {
+				// Disconnect the slow consumer.
+				try {
+					consumer.controller?.error(
+						new Error("Subscriber too slow: backpressure overflow"),
+					);
+				} catch {
+					// Already errored — ignore.
+				}
+				this.removeConsumer(consumer.id);
+				continue;
+			}
+
+			// "resync": fast-forward the consumer to the buffer head and
+			// hand it a fresh full-state snapshot.  Dropping its claim on
+			// the old frames lets the buffer be trimmed (bounding memory),
+			// and the snapshot guarantees convergence with no lost deltas.
+			consumer.initialFrames = this.onResync ? this.onResync() : [];
+			consumer.cursor = head;
+		}
+
+		// Reclaim buffer entries no consumer needs any more now that the
+		// laggards have been fast-forwarded.
+		this.tryTrimBuffer();
 	}
 
 	/**

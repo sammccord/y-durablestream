@@ -195,7 +195,10 @@ describe("DurableObjectKvStorage", () => {
 			expect(storage.transaction).toHaveBeenCalledOnce();
 			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 5);
 			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 1);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:update:1", update);
+			expect(storage.put).toHaveBeenCalledWith(
+				"ydoc:update:00000000000000000001",
+				update,
+			);
 		});
 
 		it("increments byte count and update count", async () => {
@@ -212,7 +215,10 @@ describe("DurableObjectKvStorage", () => {
 
 			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 13);
 			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 3);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:update:3", update);
+			expect(storage.put).toHaveBeenCalledWith(
+				"ydoc:update:00000000000000000003",
+				update,
+			);
 		});
 
 		it("uses a transaction for atomicity", async () => {
@@ -350,7 +356,10 @@ describe("DurableObjectKvStorage", () => {
 				expect.anything(),
 			);
 			// Should have stored the incremental update
-			expect(storage.put).toHaveBeenCalledWith("ydoc:update:6", update);
+			expect(storage.put).toHaveBeenCalledWith(
+				"ydoc:update:00000000000000000006",
+				update,
+			);
 		});
 	});
 
