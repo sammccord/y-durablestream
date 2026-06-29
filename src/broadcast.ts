@@ -22,6 +22,13 @@ import type { BackpressurePolicy } from "./types";
 /** Resolve callback for a consumer waiting for new data. */
 type PullResolver = () => void;
 
+/** A buffered frame plus its optional routing key (entity id, etc.). */
+interface BufferEntry {
+	frame: Uint8Array;
+	/** Interest routing key; `undefined` = control frame delivered to all. */
+	key: string | undefined;
+}
+
 /** Per-consumer bookkeeping. */
 interface ConsumerState {
 	/** Unique id for this consumer. */
@@ -32,6 +39,12 @@ interface ConsumerState {
 	 * `undefined` for consumers that never send updates.
 	 */
 	clientId: string | undefined;
+	/**
+	 * Interest set of routing keys. `null` means "interested in everything"
+	 * (the full-sync default). Otherwise the consumer receives only keyless
+	 * (control) frames and keyed frames whose key is in this set.
+	 */
+	interest: Set<string> | null;
 	/** Position in the shared buffer (absolute index). */
 	cursor: number;
 	/** Per-consumer initial frames (SyncStep1+2) drained before shared buffer. */
@@ -52,6 +65,29 @@ export interface BroadcastConsumer {
 	readonly readable: ReadableStream<Uint8Array>;
 	/** Cancel and clean up this consumer. */
 	cancel(): void;
+	/**
+	 * Update this consumer's interest set (for a consumer created with an
+	 * interest set; a no-op for a full-sync `null`-interest consumer). Newly
+	 * added keys take effect for frames pushed afterwards; the caller is
+	 * responsible for separately delivering current state for added keys
+	 * (e.g. a mini-snapshot). Removed keys simply stop being delivered.
+	 */
+	setInterest(change: { add?: Iterable<string>; remove?: Iterable<string> }): void;
+}
+
+/** Options for {@link BroadcastBuffer.push}. */
+export interface PushOptions {
+	/**
+	 * If set, the caught-up consumer whose `clientId` matches is fast-forwarded
+	 * past this frame so it does not receive an echo of its own update.
+	 */
+	originId?: string;
+	/**
+	 * Routing key for interest filtering. A consumer with an interest set
+	 * receives this frame only if its set contains `key`. Omit for a control
+	 * frame delivered to every consumer regardless of interest.
+	 */
+	key?: string;
 }
 
 export interface BroadcastBufferOptions {
@@ -84,15 +120,18 @@ export interface BroadcastBufferOptions {
 	 * omitted, a lagging consumer under `"resync"` is fast-forwarded to
 	 * the buffer head **without** a snapshot, which can diverge a CRDT
 	 * subscriber — so a real provider must always supply this.
+	 *
+	 * Receives the lagging consumer's interest set (`null` for full sync) so
+	 * the rebuilt snapshot is scoped to what that consumer actually wants.
 	 */
-	onResync?: () => Uint8Array[];
+	onResync?: (interest: Set<string> | null) => Uint8Array[];
 }
 
 // ─── Implementation ─────────────────────────────────────────────
 
 export class BroadcastBuffer {
-	/** Shared ring buffer of framed messages. */
-	private buffer: Uint8Array[] = [];
+	/** Shared ring buffer of framed messages (each with its routing key). */
+	private buffer: BufferEntry[] = [];
 
 	/**
 	 * Absolute index of `buffer[0]`.  Cursors are absolute so that
@@ -106,7 +145,7 @@ export class BroadcastBuffer {
 	private readonly highWaterMark: number;
 	private readonly backpressure: BackpressurePolicy;
 	private readonly onEmpty?: () => void;
-	private readonly onResync?: () => Uint8Array[];
+	private readonly onResync?: (interest: Set<string> | null) => Uint8Array[];
 
 	constructor(options?: BroadcastBufferOptions) {
 		this.highWaterMark = options?.highWaterMark ?? 64;
@@ -126,14 +165,13 @@ export class BroadcastBuffer {
 	 * policy.
 	 *
 	 * @param frame - The framed message to deliver.
-	 * @param originId - If set, the caught-up consumer whose `clientId`
-	 *   matches is fast-forwarded past this frame so it does not receive
-	 *   an echo of its own update.  (A consumer that has fallen behind
-	 *   still receives it; re-applying is idempotent in Yjs.)
+	 * @param opts - Optional routing: `originId` (echo suppression) and `key`
+	 *   (interest filtering). See {@link PushOptions}.
 	 */
-	push(frame: Uint8Array, originId?: string): void {
+	push(frame: Uint8Array, opts?: PushOptions): void {
+		const originId = opts?.originId;
 		const headBefore = this.baseIndex + this.buffer.length;
-		this.buffer.push(frame);
+		this.buffer.push({ frame, key: opts?.key });
 		const headAfter = this.baseIndex + this.buffer.length;
 
 		// Skip echoing the frame back to its originator when that consumer
@@ -177,16 +215,21 @@ export class BroadcastBuffer {
 	 *   the provider packs SyncStep1 + SyncStep2 into one element).
 	 * @param clientId - Optional id identifying the consumer so its own
 	 *   updates are not echoed back to it (see {@link push}).
+	 * @param interest - Optional set of routing keys this consumer wants. When
+	 *   provided, the consumer receives only keyless (control) frames and keyed
+	 *   frames whose key is in the set. Omit (or pass `null`) for full sync.
 	 */
 	createConsumer(
 		initialFrames?: Uint8Array[],
 		clientId?: string,
+		interest?: Iterable<string> | null,
 	): BroadcastConsumer {
 		const id = this.nextId++;
 
 		const state: ConsumerState = {
 			id,
 			clientId,
+			interest: interest == null ? null : new Set(interest),
 			// New consumers start at the current buffer head so they
 			// don't receive historical frames (they get initial sync
 			// via `initialFrames` instead).
@@ -214,31 +257,28 @@ export class BroadcastBuffer {
 					return;
 				}
 
-				// 2. Read from shared buffer if data is available.
-				const localIndex = state.cursor - self.baseIndex;
-				if (localIndex < self.buffer.length) {
-					const frame = self.buffer[localIndex];
-					state.cursor++;
+				// 2. Deliver the next frame this consumer is interested in.
+				//    takeNext may skip (advance past) non-interest frames, so
+				//    trim after it even when nothing is delivered — otherwise a
+				//    consumer that skips everything would advance its cursor but
+				//    never let the buffer reclaim those frames.
+				let frame = self.takeNext(state);
+				self.tryTrimBuffer();
+				if (frame !== null) {
 					controller.enqueue(frame);
-					self.tryTrimBuffer();
 					return;
 				}
 
-				// 3. No data available — wait for the next push().
+				// 3. No deliverable data — wait for the next push()/setInterest.
 				await new Promise<void>((resolve) => {
 					state.resolver = resolve;
 				});
-
-				// Re-check after waking (cursor may have been advanced
-				// by backpressure trimming while we were waiting).
 				if (state.cancelled) return;
 
-				const idx = state.cursor - self.baseIndex;
-				if (idx >= 0 && idx < self.buffer.length) {
-					const frame = self.buffer[idx];
-					state.cursor++;
+				frame = self.takeNext(state);
+				self.tryTrimBuffer();
+				if (frame !== null) {
 					controller.enqueue(frame);
-					self.tryTrimBuffer();
 				}
 			},
 
@@ -251,7 +291,60 @@ export class BroadcastBuffer {
 			this.removeConsumer(id);
 		};
 
-		return { readable, cancel };
+		const setInterest = (change: { add?: Iterable<string>; remove?: Iterable<string> }) => {
+			this.setConsumerInterest(id, change);
+		};
+
+		return { readable, cancel, setInterest };
+	}
+
+	/**
+	 * Advance `state.cursor` past frames this consumer is not interested in and
+	 * return the next deliverable frame, or `null` if it has reached the buffer
+	 * head. Skipping non-interest frames here (rather than enqueuing them) is
+	 * what makes per-consumer interest filtering work over the shared buffer —
+	 * and it advances the cursor, so skipped frames never starve trimming.
+	 */
+	private takeNext(state: ConsumerState): Uint8Array | null {
+		for (;;) {
+			let idx = state.cursor - this.baseIndex;
+			if (idx < 0) {
+				// Cursor fell behind the trimmed head (shouldn't happen with
+				// resync); resnap to the base to stay safe.
+				state.cursor = this.baseIndex;
+				idx = 0;
+			}
+			if (idx >= this.buffer.length) return null;
+			const entry = this.buffer[idx];
+			state.cursor++;
+			if (this.isInterested(state, entry)) return entry.frame;
+		}
+	}
+
+	/** Whether `state` wants `entry`: keyless frames + matching keyed frames. */
+	private isInterested(state: ConsumerState, entry: BufferEntry): boolean {
+		if (entry.key === undefined) return true; // control frame → everyone
+		if (state.interest === null) return true; // full-sync consumer
+		return state.interest.has(entry.key);
+	}
+
+	/**
+	 * Mutate a consumer's interest set and wake it (newly-added keys may match
+	 * already-buffered frames). No-op for a full-sync (`null`-interest) consumer.
+	 */
+	private setConsumerInterest(
+		id: number,
+		change: { add?: Iterable<string>; remove?: Iterable<string> },
+	): void {
+		const consumer = this.consumers.get(id);
+		if (!consumer || consumer.cancelled || consumer.interest === null) return;
+		for (const k of change.add ?? []) consumer.interest.add(k);
+		for (const k of change.remove ?? []) consumer.interest.delete(k);
+		if (consumer.resolver) {
+			const resolve = consumer.resolver;
+			consumer.resolver = null;
+			resolve();
+		}
 	}
 
 	/** Number of active consumers. */
@@ -346,7 +439,7 @@ export class BroadcastBuffer {
 			// hand it a fresh full-state snapshot.  Dropping its claim on
 			// the old frames lets the buffer be trimmed (bounding memory),
 			// and the snapshot guarantees convergence with no lost deltas.
-			consumer.initialFrames = this.onResync ? this.onResync() : [];
+			consumer.initialFrames = this.onResync ? this.onResync(consumer.interest) : [];
 			consumer.cursor = head;
 		}
 

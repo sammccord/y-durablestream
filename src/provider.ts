@@ -33,12 +33,17 @@ const MESSAGE_SYNC = 0;
 const EMPTY_DOC_UPDATE_BYTES = 2;
 
 /**
- * Transaction origin used for subscriber updates that carry no client
- * id.  Distinct from `this` (the provider) so handlers can tell remote
- * updates apart; never matches a consumer's client id, so such updates
- * broadcast to every subscriber.
+ * Structured transaction origin used for every applied update. Threaded
+ * through `readSyncMessage` / `applyUpdate` so the `doc.on('update')` handler
+ * can recover both the originating subscriber (`clientId`, for echo
+ * suppression) and the interest routing `key` (for per-consumer filtering).
+ * A plain object so it never equals a consumer's `clientId` string nor a
+ * client's `this`.
  */
-const REMOTE_ORIGIN = "y-stream-remote";
+interface BroadcastOrigin {
+	clientId?: string;
+	key?: string;
+}
 
 // ═══════════════════════════════════════════════════════════
 // Sync message helpers
@@ -202,10 +207,12 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 					}),
 				);
 			},
-			// Supply a fresh full-state burst so a consumer that falls
-			// behind under the "resync" policy converges without losing
-			// any deltas.
-			onResync: () => this.buildInitialFrames(),
+			// Supply a fresh burst (scoped to the consumer's interest) so a
+			// consumer that falls behind under the "resync" policy converges
+			// without losing any deltas — and without re-dumping the whole doc
+			// onto an interest-scoped subscriber.
+			onResync: (interest) =>
+				this.buildInitialFrames(interest ? [...interest] : undefined),
 		});
 		this.doc = new Doc({ gc: options?.gc ?? true });
 		this.storage = this.createStorage();
@@ -260,13 +267,11 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		}
 
 		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
-			// `origin` is the value passed to readSyncMessage/applyUpdate.
-			// For subscriber updates it is the sender's client id, used to
-			// avoid echoing the update back to that subscriber.
-			this.handleDocUpdate(
-				update,
-				typeof origin === "string" ? origin : undefined,
-			);
+			// `origin` is the BroadcastOrigin passed to readSyncMessage/applyUpdate
+			// (undefined for the initial state load above). Recover the sender's
+			// client id (echo suppression) and the interest routing key.
+			const o = origin && typeof origin === "object" ? (origin as BroadcastOrigin) : undefined;
+			this.handleDocUpdate(update, o?.clientId, o?.key);
 		});
 	}
 
@@ -280,15 +285,24 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * @param clientId - Optional stable id for the subscriber.  Pass the
 	 *   same id to {@link update} so the provider can avoid echoing the
 	 *   subscriber's own changes back to it over this stream.
+	 * @param interest - Optional set of routing keys this subscriber wants.
+	 *   When provided, it receives only keyless (control) frames and keyed
+	 *   updates whose key is in the set, and its initial sync is built via
+	 *   {@link buildInitialFrames} with this interest (a subclass filters the
+	 *   snapshot accordingly). Omit for full sync.
 	 * @returns A `ReadableStream<Uint8Array>` that delivers length-framed
 	 *   Yjs sync protocol messages.  The initial burst contains
 	 *   SyncStep1 + SyncStep2; subsequent chunks are incremental
 	 *   sync Update messages.
 	 */
-	async subscribe(clientId?: string): Promise<ReadableStream<Uint8Array>> {
+	async subscribe(
+		clientId?: string,
+		interest?: string[],
+	): Promise<ReadableStream<Uint8Array>> {
 		const consumer = this.broadcast.createConsumer(
-			this.buildInitialFrames(),
+			this.buildInitialFrames(interest),
 			clientId,
+			interest,
 		);
 		return consumer.readable;
 	}
@@ -303,8 +317,18 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * readable side crosses the RPC boundary, and is reused by the
 	 * broadcast buffer's `"resync"` backpressure recovery to bring a
 	 * lagging consumer back to the current document state.
+	 *
+	 * The base implementation sends the **full** document and ignores
+	 * `interest`. Override in a subclass to build an interest-scoped snapshot
+	 * (only the wanted entities), since the structure of the document — and
+	 * thus how a routing key maps to content — is application-specific.
+	 *
+	 * @param interest - The subscriber's interest set, or `undefined` for full
+	 *   sync (also `undefined` on a `"resync"` rebuild, which uses the consumer's
+	 *   current interest via {@link createConsumer}).
 	 */
-	private buildInitialFrames(): Uint8Array[] {
+	protected buildInitialFrames(interest?: readonly string[]): Uint8Array[] {
+		void interest; // full-sync default; subclasses filter by interest
 		// Each message is chunked into `frameChunkSize` frames so a full-document
 		// SyncStep2 larger than the frame cap is split (and reassembled by the
 		// client) rather than rejected. SyncStep1 is small (a single frame).
@@ -331,10 +355,15 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * @param clientId Optional id matching the one passed to
 	 *   {@link subscribe}.  When provided, the resulting change is not
 	 *   echoed back to that subscriber's own stream.
+	 * @param key Optional interest routing key for the resulting broadcast
+	 *   (e.g. the entity id this update concerns). Consumers with an interest
+	 *   set receive it only if the key is in their set; omit for a control
+	 *   update delivered to all.
 	 */
 	async update(
 		data: Uint8Array,
 		clientId?: string,
+		key?: string,
 	): Promise<Uint8Array | void> {
 		const decoder = createDecoder(data);
 		const encoder = createEncoder();
@@ -342,7 +371,8 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 
 		if (msgType === MESSAGE_SYNC) {
 			writeVarUint(encoder, MESSAGE_SYNC);
-			readSyncMessage(decoder, encoder, this.doc, clientId ?? REMOTE_ORIGIN);
+			const origin: BroadcastOrigin = { clientId, key };
+			readSyncMessage(decoder, encoder, this.doc, origin);
 
 			// If readSyncMessage produced a response (e.g. a SyncStep2 reply
 			// to a client's SyncStep1), return it so the caller can process it.
@@ -363,9 +393,12 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 *
 	 * @param update A Yjs encoded document update (`Y.encodeStateAsUpdate`
 	 *   or the `update` argument from a `doc.on('update')` handler).
+	 * @param key Optional interest routing key for the resulting broadcast
+	 *   (see {@link update}).
 	 */
-	async applyUpdate(update: Uint8Array): Promise<void> {
-		applyUpdate(this.doc, update);
+	async applyUpdate(update: Uint8Array, key?: string): Promise<void> {
+		const origin: BroadcastOrigin | undefined = key !== undefined ? { key } : undefined;
+		applyUpdate(this.doc, update, origin);
 	}
 
 	/**
@@ -394,8 +427,8 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * subscriber on the next SyncStep1/SyncStep2 handshake, so the only
 	 * consequence is delayed durability — never silent divergence.
 	 */
-	private handleDocUpdate(update: Uint8Array, originId?: string): void {
-		this.broadcastUpdate(update, originId);
+	private handleDocUpdate(update: Uint8Array, originId?: string, key?: string): void {
+		this.broadcastUpdate(update, originId, key);
 		this.ctx.waitUntil(
 			this.storage.storeUpdate(update).catch((err) => {
 				this.onStorageError(err);
@@ -426,14 +459,16 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 *
 	 * @param originId - When set, the originating subscriber is not sent
 	 *   an echo of its own update (see {@link BroadcastBuffer.push}).
+	 * @param key - Interest routing key; consumers with an interest set
+	 *   receive this only if the key is in their set (keyless = all).
 	 */
-	private broadcastUpdate(update: Uint8Array, originId?: string): void {
+	private broadcastUpdate(update: Uint8Array, originId?: string, key?: string): void {
 		if (this.broadcast.consumerCount === 0) return;
 
 		// Updates are normally a single frame; a rare oversized update is
 		// chunked too, keeping every frame within the cap.
 		for (const frame of encodeMessage(createSyncUpdateMessage(update), this.frameChunkSize)) {
-			this.broadcast.push(frame, originId);
+			this.broadcast.push(frame, { originId, key });
 		}
 	}
 }

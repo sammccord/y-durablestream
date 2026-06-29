@@ -538,3 +538,52 @@ describe("Reconnection", () => {
 		expect(await sub.getStatus()).toBe("no-client");
 	});
 });
+
+// ──────────────────────────────────────────────────────────
+// Interest-filtered sync (Phase C / S1)
+// ──────────────────────────────────────────────────────────
+
+describe("Interest-filtered sync", () => {
+	it("delivers keyed updates only to subscribers whose interest includes the key", async () => {
+		const providerName = "interest-basic-provider";
+		const provider = getProvider(providerName);
+		const subA = getSubscriber("interest-a");
+		const subB = getSubscriber("interest-b");
+
+		// A is interested in key "kx", B in key "ky".
+		await subA.connectWithInterest(providerName, ["kx"]);
+		await subB.connectWithInterest(providerName, ["ky"]);
+		await waitForSync(subA);
+		await waitForSync(subB);
+
+		// Keyed provider mutations: field `fx` under key "kx", `fy` under "ky".
+		await provider.applyUpdate(createTextUpdate("fx", "X"), "kx");
+		await provider.applyUpdate(createTextUpdate("fy", "Y"), "ky");
+
+		// Each subscriber receives only its keyed update.
+		await waitForSubscriberText(subA, "fx", "X");
+		await waitForSubscriberText(subB, "fy", "Y");
+
+		// ...and not the other's (it had ample time to arrive if unfiltered).
+		expect(await subA.getText("fy")).toBe("");
+		expect(await subB.getText("fx")).toBe("");
+	});
+
+	it("a keyless update broadcasts to every subscriber regardless of interest", async () => {
+		const providerName = "interest-control-provider";
+		const provider = getProvider(providerName);
+		const subA = getSubscriber("interest-ctrl-a");
+		const subB = getSubscriber("interest-ctrl-b");
+
+		await subA.connectWithInterest(providerName, ["kx"]);
+		await subB.connectWithInterest(providerName, ["ky"]);
+		await waitForSync(subA);
+		await waitForSync(subB);
+
+		// No key ⇒ control frame ⇒ delivered to all interest sets.
+		await provider.applyUpdate(createTextUpdate("shared", "all"));
+
+		await waitForSubscriberText(subA, "shared", "all");
+		await waitForSubscriberText(subB, "shared", "all");
+	});
+});

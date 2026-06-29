@@ -12,8 +12,12 @@ export interface YStreamProviderStub {
 	 * @param clientId Optional stable id for this subscriber.  Pass the
 	 *   same id to {@link update} so the provider does not echo the
 	 *   subscriber's own changes back over this stream.
+	 * @param interest Optional set of routing keys this subscriber wants. When
+	 *   provided, it receives only keyless (control) frames and keyed updates
+	 *   whose key is in the set, and an interest-scoped initial sync. Omit for
+	 *   full sync.
 	 */
-	subscribe(clientId?: string): Promise<ReadableStream<Uint8Array>>;
+	subscribe(clientId?: string, interest?: string[]): Promise<ReadableStream<Uint8Array>>;
 
 	/**
 	 * Send a Yjs sync protocol message to the provider.
@@ -26,8 +30,12 @@ export interface YStreamProviderStub {
 	 * @param clientId Optional id matching the one passed to
 	 *   {@link subscribe}, enabling the provider to suppress the echo of
 	 *   this update back to the sender.
+	 * @param key Optional interest routing key for the resulting broadcast
+	 *   (e.g. the entity id this update concerns). Consumers with an interest
+	 *   set receive it only if the key is in their set; omit for a control
+	 *   update delivered to all.
 	 */
-	update(data: Uint8Array, clientId?: string): Promise<Uint8Array | void>;
+	update(data: Uint8Array, clientId?: string, key?: string): Promise<Uint8Array | void>;
 
 	/**
 	 * Get the full Yjs document state as a single encoded update.
@@ -90,6 +98,16 @@ export interface YStreamClientOptions {
 	 * @default 1048576 (1 MB)
 	 */
 	maxFrameSize?: number;
+
+	/**
+	 * Interest set of routing keys passed to `subscribe`. When provided, the
+	 * provider streams only keyless (control) frames and keyed updates whose
+	 * key is in the set, plus an interest-scoped initial sync. Omit for full
+	 * sync. Outgoing local updates are keyed by their transaction origin's
+	 * `key` (set `doc.transact(fn, { key })` so the change routes to the right
+	 * interest); updates with no key broadcast to all.
+	 */
+	interest?: string[];
 }
 
 /**

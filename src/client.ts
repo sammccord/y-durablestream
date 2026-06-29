@@ -131,6 +131,12 @@ export class YStreamClient {
 	private readonly maxFrameSize: number | undefined;
 
 	/**
+	 * Interest set passed to `subscribe`, scoping which keyed updates this
+	 * client receives. `undefined` = full sync.
+	 */
+	private readonly interest: string[] | undefined;
+
+	/**
 	 * Set to `true` when a connection reaches the `"synced"` state.
 	 * Used by the reconnect loop to reset the retry counter after a
 	 * successful connection.
@@ -141,6 +147,7 @@ export class YStreamClient {
 		this.doc = doc;
 		this.stub = options.stub;
 		this.maxFrameSize = options.maxFrameSize;
+		this.interest = options.interest;
 		this.reconnectOptions = options.reconnect
 			? {
 					maxRetries:
@@ -290,7 +297,7 @@ export class YStreamClient {
 
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe(this.clientId);
+			stream = await this.stub.subscribe(this.clientId, this.interest);
 		} catch {
 			this.setStatus("disconnected");
 			return;
@@ -312,7 +319,14 @@ export class YStreamClient {
 			if (origin === this) {
 				return;
 			}
-			this.sendUpdate(update);
+			// Route the update by its transaction origin's `key` (e.g. the
+			// mutated entity id) so the provider can interest-filter it; a
+			// keyless local change broadcasts to all consumers.
+			const key =
+				origin && typeof origin === "object"
+					? (origin as { key?: unknown }).key
+					: undefined;
+			this.sendUpdate(update, typeof key === "string" ? key : undefined);
 		};
 		this.doc.on("update", this.updateHandler);
 
@@ -472,13 +486,13 @@ export class YStreamClient {
 
 	/**
 	 * Wrap a raw Yjs doc update in a sync Update message and send it
-	 * to the provider.
+	 * to the provider, tagged with an optional interest routing `key`.
 	 */
-	private sendUpdate(update: Uint8Array): void {
+	private sendUpdate(update: Uint8Array, key?: string): void {
 		const encoder = createEncoder();
 		writeVarUint(encoder, MESSAGE_SYNC);
 		writeUpdate(encoder, update);
-		void this.stub.update(toUint8Array(encoder), this.clientId);
+		void this.stub.update(toUint8Array(encoder), this.clientId, key);
 	}
 
 	// ═════════════════════════════════════

@@ -209,7 +209,7 @@ describe("BroadcastBuffer echo suppression", () => {
 		await delay(20);
 
 		// Frame originating from client-a: b receives it, a does not.
-		buf.push(frame(1), "client-a");
+		buf.push(frame(1), { originId: "client-a" });
 		// A subsequent un-attributed frame reaches everyone.
 		buf.push(frame(2));
 
@@ -226,7 +226,7 @@ describe("BroadcastBuffer echo suppression", () => {
 		// caught up when its own frame arrives.
 		await delay(20);
 		buf.push(frame(1)); // fills the stream's internal queue
-		buf.push(frame(2), "client-a"); // a is behind → not skipped
+		buf.push(frame(2), { originId: "client-a" }); // a is behind → not skipped
 
 		// Re-applying an echoed frame is idempotent in Yjs, so delivering
 		// it here is acceptable; the important guarantee is no data loss.
@@ -263,4 +263,106 @@ describe("BroadcastBuffer lifecycle", () => {
 		expect(buf.consumerCount).toBe(0);
 		expect(buf.bufferedFrameCount).toBe(0);
 	});
+});
+
+// ──────────────────────────────────────────────────────────
+// Interest-keyed filtering (Phase C / S1 spike)
+// ──────────────────────────────────────────────────────────
+
+/** Push a frame whose payload byte equals its routing key number. */
+function pushKeyed(buf: BroadcastBuffer, n: number): void {
+  buf.push(frame(n), { key: String(n) });
+}
+
+describe("BroadcastBuffer interest filtering", () => {
+  it("delivers only keyed frames in a consumer's interest, plus keyless control frames", async () => {
+    const buf = new BroadcastBuffer();
+    const a = buf.createConsumer(undefined, "ca", ["1"]);
+    const b = buf.createConsumer(undefined, "cb", ["2"]);
+    const ra = a.readable.getReader();
+    const rb = b.readable.getReader();
+    await delay(20);
+
+    pushKeyed(buf, 1); // → a only
+    pushKeyed(buf, 2); // → b only
+    pushKeyed(buf, 9); // → neither (no consumer interested)
+    buf.push(frame(0)); // keyless control → everyone
+
+    expect(await readUpTo(ra, 3)).toEqual([1, 0]);
+    expect(await readUpTo(rb, 3)).toEqual([2, 0]);
+  });
+
+  it("delivers a shared key to all interested consumers (overlapping interest)", async () => {
+    const buf = new BroadcastBuffer();
+    const a = buf.createConsumer(undefined, "ca", ["1", "2"]);
+    const b = buf.createConsumer(undefined, "cb", ["2", "3"]);
+    const ra = a.readable.getReader();
+    const rb = b.readable.getReader();
+    await delay(20);
+
+    pushKeyed(buf, 1); // a
+    pushKeyed(buf, 2); // a + b (shared)
+    pushKeyed(buf, 3); // b
+
+    expect(await readUpTo(ra, 3)).toEqual([1, 2]);
+    expect(await readUpTo(rb, 3)).toEqual([2, 3]);
+  });
+
+  it("a null-interest (full-sync) consumer receives every keyed frame", async () => {
+    const buf = new BroadcastBuffer();
+    const all = buf.createConsumer(); // no interest ⇒ full sync
+    const reader = all.readable.getReader();
+    await delay(20);
+
+    pushKeyed(buf, 1);
+    pushKeyed(buf, 2);
+    pushKeyed(buf, 3);
+
+    expect(await readUpTo(reader, 3)).toEqual([1, 2, 3]);
+  });
+
+  it("setInterest add starts delivering a newly-interesting key (future frames only)", async () => {
+    const buf = new BroadcastBuffer();
+    const a = buf.createConsumer(undefined, "ca", ["1"]);
+    const reader = a.readable.getReader();
+    await delay(20);
+
+    pushKeyed(buf, 2); // not interested — skipped (cursor advances past it)
+    await delay(20);
+    a.setInterest({ add: ["2"] });
+    pushKeyed(buf, 2); // now interested → delivered (the post-add one)
+
+    // Only the post-add frame; the earlier 2 was already skipped.
+    expect(await readUpTo(reader, 2)).toEqual([2]);
+  });
+
+  it("setInterest remove stops delivering a key", async () => {
+    const buf = new BroadcastBuffer();
+    const a = buf.createConsumer(undefined, "ca", ["1", "2"]);
+    const reader = a.readable.getReader();
+    await delay(20);
+
+    pushKeyed(buf, 1); // delivered
+    expect(await readUpTo(reader, 1)).toEqual([1]);
+
+    a.setInterest({ remove: ["2"] });
+    pushKeyed(buf, 2); // now skipped
+    pushKeyed(buf, 1); // delivered
+    expect(await readUpTo(reader, 2)).toEqual([1]);
+  });
+
+  it("skipped (non-interest) frames still advance the cursor so the buffer is trimmed", async () => {
+    const buf = new BroadcastBuffer();
+    const a = buf.createConsumer(undefined, "ca", ["keep"]);
+    const reader = a.readable.getReader();
+    await delay(20);
+
+    // 50 frames the sole consumer does not want.
+    for (let i = 0; i < 50; i++) buf.push(frame(i & 0xff), { key: "other" });
+    await delay(50); // let the consumer skip them all
+
+    // Cursor advanced past every skipped frame ⇒ buffer reclaimed (not starved).
+    expect(buf.bufferedFrameCount).toBe(0);
+    void reader;
+  });
 });
