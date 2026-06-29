@@ -207,3 +207,137 @@ export class FrameDecodeError extends Error {
 		this.name = "FrameDecodeError";
 	}
 }
+
+// ─── Message layer (multi-part, over the frame layer) ────────────────
+
+/**
+ * Per-frame part header on the message layer: `[totalParts:u32][partIndex:u32]`.
+ * Lets one logical message (e.g. a full-document `SyncStep2` larger than the
+ * frame cap) be split across multiple sub-cap frames and reassembled, instead
+ * of being rejected by the frame size limit.
+ */
+const PART_HEADER_SIZE = 8;
+
+/**
+ * Encode a message as one or more length-prefixed frames, each no larger than
+ * `maxFrameSize`. A message that fits is a single frame; a larger one is split
+ * into `ceil(len / (maxFrameSize - 8))` parts.
+ *
+ * The split is purely at the **byte** level — the parts concatenate back to the
+ * exact original bytes, so a chunked Yjs update keeps its real struct identity
+ * (unlike repackaging through a temp doc) and applies as one `applyUpdate`.
+ *
+ * @param message - The raw message bytes (e.g. a Yjs sync protocol message).
+ * @param maxFrameSize - Maximum size of each produced frame, in bytes.
+ *   @default {@link DEFAULT_MAX_FRAME_SIZE}
+ * @returns Frames to send in order; reassemble with {@link createMessageDecoder}.
+ */
+export function encodeMessage(
+	message: Uint8Array,
+	maxFrameSize: number = DEFAULT_MAX_FRAME_SIZE,
+): Uint8Array[] {
+	const maxChunk = Math.max(1, maxFrameSize - HEADER_SIZE - PART_HEADER_SIZE);
+	const total = Math.max(1, Math.ceil(message.byteLength / maxChunk));
+	const frames: Uint8Array[] = [];
+	for (let index = 0; index < total; index++) {
+		const chunk = message.subarray(index * maxChunk, (index + 1) * maxChunk);
+		const payload = new Uint8Array(PART_HEADER_SIZE + chunk.byteLength);
+		const view = new DataView(payload.buffer);
+		view.setUint32(0, total, false);
+		view.setUint32(4, index, false);
+		payload.set(chunk, PART_HEADER_SIZE);
+		frames.push(encodeFrame(payload));
+	}
+	return frames;
+}
+
+/**
+ * A decoder that reassembles whole messages produced by {@link encodeMessage}
+ * from arbitrarily chunked stream data. Wraps a {@link FrameDecoder} (so the
+ * per-frame `maxFrameSize` cap still applies to each part) and rebuilds the
+ * logical message from its parts before returning it.
+ *
+ * Robust to mid-message drops (e.g. a backpressure `resync` that fast-forwards
+ * the consumer past the tail of a message): a part with `index === 0` always
+ * starts a fresh message, discarding any incomplete prior assembly, and stray
+ * parts that don't match the in-progress message are ignored. Since every
+ * message (including a resync snapshot) begins at index 0, the next message's
+ * first part cleanly resets the decoder.
+ */
+export function createMessageDecoder(options?: FrameDecoderOptions): MessageDecoder {
+	const frames = createFrameDecoder(options);
+	let parts: (Uint8Array | undefined)[] = [];
+	let total = 0;
+	let have = 0;
+
+	function push(chunk: Uint8Array): Uint8Array[] {
+		const messages: Uint8Array[] = [];
+		for (const payload of frames.push(chunk)) {
+			if (payload.byteLength < PART_HEADER_SIZE) continue; // malformed; skip
+			const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+			const partTotal = view.getUint32(0, false);
+			const index = view.getUint32(4, false);
+			const data = payload.subarray(PART_HEADER_SIZE);
+
+			if (index === 0) {
+				// Start of a message — discard any incomplete prior assembly.
+				parts = new Array(partTotal);
+				total = partTotal;
+				have = 0;
+			} else if (partTotal !== total || index >= total || parts.length === 0) {
+				continue; // stray part (e.g. tail after a resync jump) — ignore
+			}
+
+			if (parts[index] === undefined) {
+				parts[index] = data;
+				have++;
+			}
+			if (total > 0 && have === total) {
+				messages.push(concatParts(parts as Uint8Array[]));
+				parts = [];
+				total = 0;
+				have = 0;
+			}
+		}
+		return messages;
+	}
+
+	function reset(): void {
+		parts = [];
+		total = 0;
+		have = 0;
+		frames.reset();
+	}
+
+	function bufferedBytes(): number {
+		return frames.bufferedBytes();
+	}
+
+	return { push, reset, bufferedBytes };
+}
+
+/** Concatenate ordered, fully-populated message parts into one buffer. */
+function concatParts(parts: Uint8Array[]): Uint8Array {
+	let length = 0;
+	for (const part of parts) length += part.byteLength;
+	const out = new Uint8Array(length);
+	let offset = 0;
+	for (const part of parts) {
+		out.set(part, offset);
+		offset += part.byteLength;
+	}
+	return out;
+}
+
+/**
+ * The interface returned by {@link createMessageDecoder}. Mirrors
+ * {@link FrameDecoder}, but `push` returns fully reassembled messages.
+ */
+export interface MessageDecoder {
+	/** Push stream bytes; returns any messages fully reassembled by this chunk. */
+	push(chunk: Uint8Array): Uint8Array[];
+	/** Reset both the reassembly state and the underlying frame buffer. */
+	reset(): void;
+	/** Bytes buffered in the underlying frame decoder (partial frame). */
+	bufferedBytes(): number;
+}

@@ -56,11 +56,13 @@ export { YStreamClient } from "./client";
 export {
 	encodeFrame,
 	encodeFrames,
+	encodeMessage,
 	createFrameDecoder,
+	createMessageDecoder,
 	FrameDecodeError,
 	DEFAULT_MAX_FRAME_SIZE,
 } from "./protocol";
-export type { FrameDecoder, FrameDecoderOptions } from "./protocol";
+export type { FrameDecoder, FrameDecoderOptions, MessageDecoder } from "./protocol";
 export {
 	DurableObjectKvStorage,
 	DurableObjectSqlStorage,

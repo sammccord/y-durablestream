@@ -3,7 +3,9 @@ import { describe, it, expect } from "vitest";
 import {
 	encodeFrame,
 	encodeFrames,
+	encodeMessage,
 	createFrameDecoder,
+	createMessageDecoder,
 	DEFAULT_MAX_FRAME_SIZE,
 	FrameDecodeError,
 } from "../src/protocol";
@@ -333,3 +335,100 @@ describe("FrameDecodeError", () => {
 		expect(err.message).toBe("something went wrong");
 	});
 });
+
+describe("encodeMessage / createMessageDecoder", () => {
+	function bytes(n: number): Uint8Array {
+		const u = new Uint8Array(n);
+		for (let i = 0; i < n; i++) u[i] = i % 256;
+		return u;
+	}
+
+	it("round-trips a small (single-frame) message", () => {
+		const msg = new Uint8Array([1, 2, 3, 4, 5]);
+		const frames = encodeMessage(msg, 1024);
+		expect(frames).toHaveLength(1);
+
+		const decoder = createMessageDecoder();
+		const out = frames.flatMap((f) => decoder.push(f));
+		expect(out).toHaveLength(1);
+		expect(Array.from(out[0])).toEqual([1, 2, 3, 4, 5]);
+	});
+
+	it("splits a large message into multiple sub-cap frames and reassembles it", () => {
+		const msg = bytes(10_000);
+		const cap = 1024; // tiny cap forces many parts
+		const frames = encodeMessage(msg, cap);
+		expect(frames.length).toBeGreaterThan(1);
+		// Every produced frame stays within the cap.
+		for (const f of frames) expect(f.byteLength).toBeLessThanOrEqual(cap);
+
+		const decoder = createMessageDecoder({ maxFrameSize: cap });
+		const out = frames.flatMap((f) => decoder.push(f));
+		expect(out).toHaveLength(1);
+		expect(out[0].byteLength).toBe(10_000);
+		expect(Array.from(out[0])).toEqual(Array.from(msg));
+	});
+
+	it("reassembles across arbitrarily-chunked stream delivery (byte-by-byte)", () => {
+		const msg = bytes(3000);
+		const cap = 256;
+		const stream = concat(encodeMessage(msg, cap));
+
+		const decoder = createMessageDecoder({ maxFrameSize: cap });
+		const out: Uint8Array[] = [];
+		for (let i = 0; i < stream.byteLength; i++) {
+			out.push(...decoder.push(stream.slice(i, i + 1)));
+		}
+		expect(out).toHaveLength(1);
+		expect(Array.from(out[0])).toEqual(Array.from(msg));
+	});
+
+	it("round-trips an empty message", () => {
+		const decoder = createMessageDecoder();
+		const out = encodeMessage(new Uint8Array(0)).flatMap((f) => decoder.push(f));
+		expect(out).toHaveLength(1);
+		expect(out[0].byteLength).toBe(0);
+	});
+
+	it("discards an incomplete message when a new one starts (resync-drop robustness)", () => {
+		const cap = 64;
+		const msgA = bytes(500); // multi-part
+		const msgB = bytes(120); // multi-part
+		const framesA = encodeMessage(msgA, cap);
+		const framesB = encodeMessage(msgB, cap);
+		expect(framesA.length).toBeGreaterThan(2);
+		expect(framesB.length).toBeGreaterThan(1);
+
+		const decoder = createMessageDecoder({ maxFrameSize: cap });
+		// Feed all of A EXCEPT its last frame (simulates a backpressure resync
+		// fast-forwarding the consumer past the tail of the in-flight message).
+		const out: Uint8Array[] = [];
+		for (const f of framesA.slice(0, -1)) out.push(...decoder.push(f));
+		expect(out).toHaveLength(0); // A never completes
+
+		// B arrives in full — its index-0 part resets the decoder, A is discarded,
+		// and only B is yielded.
+		for (const f of framesB) out.push(...decoder.push(f));
+		expect(out).toHaveLength(1);
+		expect(Array.from(out[0])).toEqual(Array.from(msgB));
+	});
+
+	it("still enforces the per-frame cap on each part", () => {
+		// A single part claiming > cap (hand-rolled) is rejected by the frame layer.
+		const header = new Uint8Array(4);
+		new DataView(header.buffer).setUint32(0, 2 * 1024 * 1024, false);
+		expect(() => createMessageDecoder().push(header)).toThrow(/exceeds maximum/);
+	});
+});
+
+function concat(frames: Uint8Array[]): Uint8Array {
+	let len = 0;
+	for (const f of frames) len += f.byteLength;
+	const out = new Uint8Array(len);
+	let off = 0;
+	for (const f of frames) {
+		out.set(f, off);
+		off += f.byteLength;
+	}
+	return out;
+}

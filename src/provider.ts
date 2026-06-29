@@ -15,7 +15,7 @@ import {
 import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
 
 import { BroadcastBuffer } from "./broadcast";
-import { encodeFrame, encodeFrames } from "./protocol";
+import { DEFAULT_MAX_FRAME_SIZE, encodeMessage } from "./protocol";
 import { DurableObjectKvStorage } from "./storage/kv";
 
 
@@ -172,10 +172,22 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 */
 	protected maxUpdates = 500;
 
+	/**
+	 * Maximum size of each frame sent to subscribers, in bytes. Messages larger
+	 * than this (notably the full-document `SyncStep2` on connect/resync) are
+	 * split into this-sized frames and reassembled by the client, so document
+	 * size is no longer bounded by a single frame. Subscribers' decoders must
+	 * accept frames at least this large (`YStreamClientOptions.maxFrameSize`).
+	 *
+	 * @default {@link DEFAULT_MAX_FRAME_SIZE} (1 MB)
+	 */
+	private readonly frameChunkSize: number;
+
 	constructor(ctx: DurableObjectState, env: E, options?: YStreamProviderOptions) {
 		super(ctx, env);
 		if (options?.maxBytes !== undefined) this.maxBytes = options.maxBytes;
 		if (options?.maxUpdates !== undefined) this.maxUpdates = options.maxUpdates;
+		this.frameChunkSize = options?.frameChunkSize ?? DEFAULT_MAX_FRAME_SIZE;
 		this.broadcast = new BroadcastBuffer({
 			highWaterMark: options?.streamHighWaterMark ?? 64,
 			backpressure: options?.backpressure ?? "resync",
@@ -293,11 +305,12 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * lagging consumer back to the current document state.
 	 */
 	private buildInitialFrames(): Uint8Array[] {
+		// Each message is chunked into `frameChunkSize` frames so a full-document
+		// SyncStep2 larger than the frame cap is split (and reassembled by the
+		// client) rather than rejected. SyncStep1 is small (a single frame).
 		return [
-			encodeFrames([
-				createSyncStep1Message(this.doc),
-				createSyncStep2Message(this.doc),
-			]),
+			...encodeMessage(createSyncStep1Message(this.doc), this.frameChunkSize),
+			...encodeMessage(createSyncStep2Message(this.doc), this.frameChunkSize),
 		];
 	}
 
@@ -417,7 +430,10 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	private broadcastUpdate(update: Uint8Array, originId?: string): void {
 		if (this.broadcast.consumerCount === 0) return;
 
-		const frame = encodeFrame(createSyncUpdateMessage(update));
-		this.broadcast.push(frame, originId);
+		// Updates are normally a single frame; a rare oversized update is
+		// chunked too, keeping every frame within the cap.
+		for (const frame of encodeMessage(createSyncUpdateMessage(update), this.frameChunkSize)) {
+			this.broadcast.push(frame, originId);
+		}
 	}
 }

@@ -7,7 +7,7 @@ import {
 } from "lib0/encoding";
 import { readSyncMessage, writeSyncStep1, writeUpdate } from "y-protocols/sync";
 
-import { createFrameDecoder } from "./protocol";
+import { createMessageDecoder } from "./protocol";
 
 import type { Doc } from "yjs";
 import type {
@@ -98,7 +98,7 @@ export class YStreamClient {
 	private readonly clientId: string = generateClientId();
 
 	private stream: ReadableStream<Uint8Array> | null = null;
-	private decoder: ReturnType<typeof createFrameDecoder> | null = null;
+	private decoder: ReturnType<typeof createMessageDecoder> | null = null;
 
 	private _status: YStreamClientStatus = "disconnected";
 	private _synced = false;
@@ -385,7 +385,7 @@ export class YStreamClient {
 	 * Always resolves — never rejects.
 	 */
 	private async readLoop(stream: ReadableStream<Uint8Array>): Promise<void> {
-		const decoder = createFrameDecoder({ maxFrameSize: this.maxFrameSize });
+		const decoder = createMessageDecoder({ maxFrameSize: this.maxFrameSize });
 		this.decoder = decoder;
 
 		try {

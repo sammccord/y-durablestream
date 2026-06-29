@@ -162,4 +162,14 @@ export interface YStreamProviderOptions {
 	 * @default 64
 	 */
 	streamHighWaterMark?: number;
+
+	/**
+	 * Maximum size of each frame sent to subscribers, in bytes. The
+	 * full-document initial sync is split into frames of this size and
+	 * reassembled by the client, so document size is not bounded by a single
+	 * frame. Subscribers' `YStreamClientOptions.maxFrameSize` must be ≥ this.
+	 *
+	 * @default 1048576 (1 MB)
+	 */
+	frameChunkSize?: number;
 }
