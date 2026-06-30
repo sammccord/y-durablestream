@@ -41,6 +41,22 @@ export interface YStreamProviderStub {
 	 * Get the full Yjs document state as a single encoded update.
 	 */
 	getYDoc(): Promise<Uint8Array>;
+
+	/**
+	 * Register a push-subscriber so the provider delivers live updates by RPC
+	 * (via its `pushToSubscriber` hook) rather than over a stream — the delivery
+	 * path for Durable Object subscribers whose stream read-loop cannot outlive
+	 * the request that opened it. Persisted; idempotent.
+	 *
+	 * @param clientId Stable subscriber id; MUST match the `clientId` passed to
+	 *   {@link update} so the subscriber's own writes are not echoed back.
+	 * @param address Opaque routing info handed back to the provider's
+	 *   `pushToSubscriber` (e.g. the subscriber DO's binding name + id).
+	 */
+	register(clientId: string, address: unknown): Promise<void>;
+
+	/** Remove a push-subscriber registered via {@link register}. Idempotent. */
+	deregister(clientId: string): Promise<void>;
 }
 
 /**
@@ -78,6 +94,15 @@ export interface ReconnectOptions {
 export interface YStreamClientOptions {
 	/** The upstream YStreamProvider DO stub to connect to. */
 	stub: YStreamProviderStub;
+
+	/**
+	 * Stable client id sent with `subscribe`/`update`/`syncOnce` so the provider
+	 * can suppress echoing this client's own writes (and, with notify-push, match
+	 * this client to its `register(clientId, ...)` entry). Defaults to a random
+	 * UUID. Set this to a stable per-subscriber value (e.g. the lobby namespace)
+	 * when you also call `register` / `pushLocalUpdate` so all three agree.
+	 */
+	clientId?: string;
 
 	/**
 	 * Enable automatic reconnection when the stream drops.

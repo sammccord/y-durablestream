@@ -12,6 +12,8 @@ interface Env {
 	Y_STREAM_SUBSCRIBER: DurableObjectNamespace<TestSubscriber>;
 	Y_SQL_PROVIDER: DurableObjectNamespace<TestSqlProvider>;
 	Y_SQL_SUBSCRIBER: DurableObjectNamespace<TestSqlSubscriber>;
+	Y_NOTIFY_PROVIDER: DurableObjectNamespace<TestNotifyProvider>;
+	Y_NOTIFY_RECEIVER: DurableObjectNamespace<TestNotifyReceiver>;
 }
 
 /**
@@ -135,6 +137,68 @@ export class TestSqlSubscriber extends DurableObject<Env> {
 	async disconnect(): Promise<void> {
 		this.client?.disconnect();
 		this.client = null;
+	}
+}
+
+/**
+ * Test provider exercising the notify-push registry. Overrides
+ * {@link YStreamProvider.pushToSubscriber} to RPC a {@link TestNotifyReceiver}
+ * DO (resolved by `address.name`) with the raw update — the app-specific
+ * delivery the base provider leaves abstract.
+ */
+export class TestNotifyProvider extends YStreamProvider<Env> {
+	protected override pushToSubscriber(address: unknown, update: Uint8Array): void {
+		const { name } = address as { name: string };
+		const receiver = this.env.Y_NOTIFY_RECEIVER.get(
+			this.env.Y_NOTIFY_RECEIVER.idFromName(name),
+		);
+		this.ctx.waitUntil(receiver.onPush(update));
+	}
+}
+
+/**
+ * Test receiver — a Durable Object that registers for notify-push (no open
+ * stream) and applies pushed updates to its local doc. Also exercises
+ * {@link YStreamClient.syncOnce}. Registers under a `clientId` equal to its own
+ * `idFromName` name, so the provider's `pushToSubscriber` can route back to it.
+ */
+export class TestNotifyReceiver extends DurableObject<Env> {
+	doc = new Doc();
+	client: YStreamClient | null = null;
+
+	private providerStub(name: string) {
+		return this.env.Y_NOTIFY_PROVIDER.get(this.env.Y_NOTIFY_PROVIDER.idFromName(name));
+	}
+
+	async register(providerName: string, clientId: string): Promise<void> {
+		await this.providerStub(providerName).register(clientId, { name: clientId });
+	}
+
+	async deregister(providerName: string, clientId: string): Promise<void> {
+		await this.providerStub(providerName).deregister(clientId);
+	}
+
+	/** Apply an update delivered via the provider's notify-push path. */
+	async onPush(update: Uint8Array): Promise<void> {
+		applyUpdate(this.doc, update);
+	}
+
+	/** One-shot bidirectional sync (no persistent stream). */
+	async syncOnceWith(providerName: string): Promise<void> {
+		this.client = new YStreamClient(this.doc, { stub: this.providerStub(providerName) });
+		await this.client.syncOnce();
+	}
+
+	async insertText(field: string, index: number, content: string): Promise<void> {
+		this.doc.getText(field).insert(index, content);
+	}
+
+	async getText(field: string): Promise<string> {
+		return this.doc.getText(field).toString();
+	}
+
+	async getStatus(): Promise<string> {
+		return this.client?.status ?? "no-client";
 	}
 }
 

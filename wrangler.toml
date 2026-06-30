@@ -19,7 +19,20 @@ class_name = "TestSqlProvider"
 name = "Y_SQL_SUBSCRIBER"
 class_name = "TestSqlSubscriber"
 
+[[durable_objects.bindings]]
+name = "Y_NOTIFY_PROVIDER"
+class_name = "TestNotifyProvider"
+
+[[durable_objects.bindings]]
+name = "Y_NOTIFY_RECEIVER"
+class_name = "TestNotifyReceiver"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["TestProvider", "TestSqlProvider"]
 new_classes = ["TestSubscriber", "TestSqlSubscriber"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["TestNotifyProvider"]
+new_classes = ["TestNotifyReceiver"]

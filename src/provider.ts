@@ -32,6 +32,9 @@ const MESSAGE_SYNC = 0;
  */
 const EMPTY_DOC_UPDATE_BYTES = 2;
 
+/** DO storage key under which the push-subscriber registry is persisted. */
+const SUBSCRIBERS_KEY = "__yds:subscribers";
+
 /**
  * Structured transaction origin used for every applied update. Threaded
  * through `readSyncMessage` / `applyUpdate` so the `doc.on('update')` handler
@@ -152,6 +155,18 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 */
 	private broadcast!: BroadcastBuffer;
 
+	/**
+	 * Persisted registry of push-subscribers: `clientId → opaque address`.
+	 *
+	 * Unlike the in-memory broadcast consumers (each bound to an open
+	 * `subscribe()` stream, lost when that request ends), this registry survives
+	 * isolate eviction. It lets the provider deliver live updates by RPC-ing each
+	 * subscriber Durable Object via {@link pushToSubscriber} — the only way to
+	 * reach a DO subscriber whose stream read-loop cannot outlive the request
+	 * that opened it. The `address` is opaque here; the subclass interprets it.
+	 */
+	private subscribers = new Map<string, unknown>();
+
 	// ═════════════════════════════════════
 	// Configurable thresholds
 	// ═════════════════════════════════════
@@ -265,6 +280,10 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 			// encodes to a 2-byte update).
 			applyUpdate(this.doc, state);
 		}
+
+		// Restore the push-subscriber registry persisted across evictions.
+		const savedSubs = await this.ctx.storage.get<Record<string, unknown>>(SUBSCRIBERS_KEY);
+		if (savedSubs) this.subscribers = new Map(Object.entries(savedSubs));
 
 		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
 			// `origin` is the BroadcastOrigin passed to readSyncMessage/applyUpdate
@@ -412,6 +431,33 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		return encodeStateAsUpdate(this.doc);
 	}
 
+	/**
+	 * Register a push-subscriber. Afterwards every applied update — except the
+	 * subscriber's own (matched by `clientId`) — is delivered to it via
+	 * {@link pushToSubscriber}, with no open `subscribe()` stream required. The
+	 * registry is persisted, so it survives provider eviction. Idempotent.
+	 *
+	 * This is the live-delivery path for **Durable Object subscribers**, whose
+	 * stream read-loop cannot outlive the request that opened it; a registered
+	 * DO subscriber is instead RPC-ed (which also wakes it from hibernation).
+	 *
+	 * @param clientId Stable subscriber id — MUST match the `clientId` the
+	 *   subscriber passes to {@link update} so its own writes are not echoed.
+	 * @param address Opaque routing info handed back verbatim to
+	 *   {@link pushToSubscriber} (e.g. the subscriber DO's binding name + id).
+	 */
+	async register(clientId: string, address: unknown): Promise<void> {
+		this.subscribers.set(clientId, address);
+		await this.ctx.storage.put(SUBSCRIBERS_KEY, Object.fromEntries(this.subscribers));
+	}
+
+	/** Remove a push-subscriber registered via {@link register}. Idempotent. */
+	async deregister(clientId: string): Promise<void> {
+		if (this.subscribers.delete(clientId)) {
+			await this.ctx.storage.put(SUBSCRIBERS_KEY, Object.fromEntries(this.subscribers));
+		}
+	}
+
 	// ═════════════════════════════════════
 	// Internal: update handling
 	// ═════════════════════════════════════
@@ -429,11 +475,50 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 */
 	private handleDocUpdate(update: Uint8Array, originId?: string, key?: string): void {
 		this.broadcastUpdate(update, originId, key);
+		this.notifySubscribers(update, originId, key);
 		this.ctx.waitUntil(
 			this.storage.storeUpdate(update).catch((err) => {
 				this.onStorageError(err);
 			}),
 		);
+	}
+
+	/**
+	 * Deliver an applied update to every registered push-subscriber except the
+	 * one that originated it (echo suppression by `clientId`). This is the
+	 * registry-based counterpart to {@link broadcastUpdate}: the latter reaches
+	 * subscribers holding an open stream, this reaches Durable Object subscribers
+	 * that have no live stream (their read-loop ended with their request) and
+	 * must be RPC-ed instead. Each delivery goes through {@link pushToSubscriber}.
+	 */
+	private notifySubscribers(update: Uint8Array, originId?: string, key?: string): void {
+		if (this.subscribers.size === 0) return;
+		for (const [clientId, address] of this.subscribers) {
+			if (clientId === originId) continue; // do not echo a subscriber's own write
+			try {
+				this.pushToSubscriber(address, update, key);
+			} catch (err) {
+				this.onStorageError(err);
+			}
+		}
+	}
+
+	/**
+	 * Deliver one update to a registered subscriber. The **base implementation is
+	 * a no-op** — the library cannot know how to reach an arbitrary subscriber
+	 * Durable Object generically. Override in a subclass to RPC the subscriber
+	 * (e.g. `this.env[address.binding].get(idFromName(address.name)).onUpdate(...)`),
+	 * typically wrapped in `this.ctx.waitUntil(...)`. Errors are routed to
+	 * {@link onStorageError}.
+	 *
+	 * @param address The opaque value passed to {@link register}.
+	 * @param update The raw Yjs document update to deliver (apply via `Y.applyUpdate`).
+	 * @param key The interest routing key for this update, if any.
+	 */
+	protected pushToSubscriber(address: unknown, update: Uint8Array, key?: string): void {
+		void address;
+		void update;
+		void key;
 	}
 
 	/**

@@ -95,7 +95,7 @@ export class YStreamClient {
 	 * provider can avoid echoing this client's own changes back over the
 	 * stream.
 	 */
-	private readonly clientId: string = generateClientId();
+	private readonly clientId: string;
 
 	private stream: ReadableStream<Uint8Array> | null = null;
 	private decoder: ReturnType<typeof createMessageDecoder> | null = null;
@@ -146,6 +146,7 @@ export class YStreamClient {
 	constructor(doc: Doc, options: YStreamClientOptions) {
 		this.doc = doc;
 		this.stub = options.stub;
+		this.clientId = options.clientId ?? generateClientId();
 		this.maxFrameSize = options.maxFrameSize;
 		this.interest = options.interest;
 		this.reconnectOptions = options.reconnect
@@ -425,39 +426,91 @@ export class YStreamClient {
 	 *   inside a length-prefixed frame, without the frame header).
 	 */
 	private handleMessage(data: Uint8Array): void {
+		const { syncType, reply } = this.decodeSyncMessage(data);
+
+		// If processing a SyncStep1 produced a SyncStep2 response,
+		// send it back to the provider.
+		if (reply) {
+			void this.stub.update(reply, this.clientId);
+		}
+
+		// Transition to "synced" after receiving SyncStep2.
+		if (syncType === SYNC_STEP_2 && !this._synced) {
+			this._synced = true;
+			this.didSync = true;
+			this.setStatus("synced");
+		}
+	}
+
+	/**
+	 * Apply one inbound sync message to the local doc and return any reply it
+	 * produced (a SyncStep2 answering the provider's SyncStep1, which carries the
+	 * data the provider was missing). Free of connection-status side effects so
+	 * both {@link handleMessage} (streaming) and {@link syncOnce} (one-shot) can
+	 * share it.
+	 *
+	 * @returns `syncType` — the sync sub-message type (0 = SyncStep1,
+	 *   1 = SyncStep2, 2 = Update, -1 = non-sync/ignored) — and `reply`, the
+	 *   bytes to send upstream via {@link YStreamProviderStub.update}, or `null`.
+	 */
+	private decodeSyncMessage(data: Uint8Array): { syncType: number; reply: Uint8Array | null } {
 		const msgDecoder = createDecoder(data);
 		const encoder = createEncoder();
 		const msgType = readVarUint(msgDecoder);
 
 		if (msgType !== MESSAGE_SYNC) {
 			// Only sync messages are supported; ignore unknown types.
-			return;
+			return { syncType: -1, reply: null };
 		}
 
 		writeVarUint(encoder, MESSAGE_SYNC);
-		const syncMessageType = readSyncMessage(
-			msgDecoder,
-			encoder,
-			this.doc,
-			this,
-		);
+		const syncType = readSyncMessage(msgDecoder, encoder, this.doc, this);
+		return { syncType, reply: length(encoder) > 1 ? toUint8Array(encoder) : null };
+	}
 
-		// readSyncMessage returns the sync sub-message type:
-		//   0 = SyncStep1 (state vector request)
-		//   1 = SyncStep2 (state response / full doc)
-		//   2 = Update    (incremental change)
-
-		// If processing a SyncStep1 produced a SyncStep2 response,
-		// send it back to the provider.
-		if (length(encoder) > 1) {
-			void this.stub.update(toUint8Array(encoder), this.clientId);
+	/**
+	 * Perform a single one-shot bidirectional sync with the provider, then
+	 * return — without holding a persistent read loop. Pulls the provider's
+	 * current state into the local doc AND pushes the local doc's missing state
+	 * up to the provider, then closes the stream.
+	 *
+	 * Safe to call repeatedly within request contexts — on shard open, on a
+	 * tick, or to recover from a missed live push. This is the counterpart to
+	 * {@link connect} for **Durable Object subscribers**, whose streaming read
+	 * loop a request cannot keep alive past its own lifetime; pair it with the
+	 * provider's {@link YStreamProviderStub.register} push path for liveness.
+	 *
+	 * Leaves {@link status}/{@link synced} untouched (it is not a persistent
+	 * connection). Always resolves; never rejects.
+	 */
+	async syncOnce(): Promise<void> {
+		let stream: ReadableStream<Uint8Array>;
+		try {
+			stream = await this.stub.subscribe(this.clientId, this.interest);
+		} catch {
+			return;
 		}
 
-		// Transition to "synced" after receiving SyncStep2.
-		if (syncMessageType === SYNC_STEP_2 && !this._synced) {
-			this._synced = true;
-			this.didSync = true;
-			this.setStatus("synced");
+		const decoder = createMessageDecoder({ maxFrameSize: this.maxFrameSize });
+		try {
+			let done = false;
+			for await (const chunk of stream) {
+				for (const msg of decoder.push(chunk)) {
+					const { syncType, reply } = this.decodeSyncMessage(msg);
+					// Push our missing state to the provider (the SyncStep2 reply to
+					// its SyncStep1). Awaited so it lands before this method resolves.
+					if (reply) await this.stub.update(reply, this.clientId);
+					// The provider's SyncStep2 completes the pull half — initial sync
+					// done; stop before the (live) tail of the stream.
+					if (syncType === SYNC_STEP_2) done = true;
+				}
+				if (done) break;
+			}
+		} catch {
+			// stream error / cancellation — best-effort one-shot
+		} finally {
+			// Breaking out of `for await` cancels the stream iterator.
+			decoder.reset();
 		}
 	}
 
@@ -493,6 +546,21 @@ export class YStreamClient {
 		writeVarUint(encoder, MESSAGE_SYNC);
 		writeUpdate(encoder, update);
 		void this.stub.update(toUint8Array(encoder), this.clientId, key);
+	}
+
+	/**
+	 * Forward a local Yjs doc update to the provider, tagged with this client's
+	 * `clientId` (so it is not echoed back to this client) and an optional
+	 * interest routing `key`. Public counterpart to the stream-mode update
+	 * forwarding, for subscribers that drive their own `doc.on('update')` (e.g. a
+	 * Durable Object that forwards its writes without holding a persistent stream).
+	 * Awaits the provider RPC so the caller can tie it to a request via `waitUntil`.
+	 */
+	async pushLocalUpdate(update: Uint8Array, key?: string): Promise<void> {
+		const encoder = createEncoder();
+		writeVarUint(encoder, MESSAGE_SYNC);
+		writeUpdate(encoder, update);
+		await this.stub.update(toUint8Array(encoder), this.clientId, key);
 	}
 
 	// ═════════════════════════════════════
