@@ -3,6 +3,7 @@ import { Doc, encodeStateAsUpdate, applyUpdate } from "yjs";
 
 import { YStreamProvider } from "../src/provider";
 import { YStreamClient } from "../src/client";
+import { DurableObjectKvStorage } from "../src/storage/kv";
 import { DurableObjectSqlStorage } from "../src/storage/sql";
 
 import type { YDocStorage } from "../src/storage/types";
@@ -14,6 +15,8 @@ interface Env {
 	Y_SQL_SUBSCRIBER: DurableObjectNamespace<TestSqlSubscriber>;
 	Y_NOTIFY_PROVIDER: DurableObjectNamespace<TestNotifyProvider>;
 	Y_NOTIFY_RECEIVER: DurableObjectNamespace<TestNotifyReceiver>;
+	Y_COMMIT_PROVIDER: DurableObjectNamespace<TestCommitCountProvider>;
+	Y_DEBOUNCE_PROVIDER: DurableObjectNamespace<TestDebounceNotifyProvider>;
 }
 
 /**
@@ -178,9 +181,17 @@ export class TestNotifyReceiver extends DurableObject<Env> {
 		await this.providerStub(providerName).deregister(clientId);
 	}
 
+	/** Number of pushes delivered via {@link onPush} (for coalescing tests). */
+	private pushCount = 0;
+
 	/** Apply an update delivered via the provider's notify-push path. */
 	async onPush(update: Uint8Array): Promise<void> {
+		this.pushCount++;
 		applyUpdate(this.doc, update);
+	}
+
+	async getPushCount(): Promise<number> {
+		return this.pushCount;
 	}
 
 	/** One-shot bidirectional sync (no persistent stream). */
@@ -199,6 +210,52 @@ export class TestNotifyReceiver extends DurableObject<Env> {
 
 	async getStatus(): Promise<string> {
 		return this.client?.status ?? "no-client";
+	}
+}
+
+/**
+ * Provider whose storage backend counts `commit` calls, exposing the count by
+ * RPC — verifies the dirty-flag gate: a read-only subscribe/close cycle (e.g.
+ * `syncOnce`) must not trigger a last-consumer-gone compaction commit.
+ */
+export class TestCommitCountProvider extends YStreamProvider<Env> {
+	private commitCount = 0;
+
+	protected override createStorage(): YDocStorage {
+		const inner = new DurableObjectKvStorage(this.ctx.storage, {
+			maxBytes: this.maxBytes,
+			maxUpdates: this.maxUpdates,
+		});
+		return {
+			getYDoc: () => inner.getYDoc(),
+			storeUpdate: (update) => inner.storeUpdate(update),
+			commit: (doc) => {
+				this.commitCount++;
+				return inner.commit(doc);
+			},
+		};
+	}
+
+	async getCommitCount(): Promise<number> {
+		return this.commitCount;
+	}
+}
+
+/**
+ * Notify-push provider with a coalescing window: updates applied within 50 ms
+ * are merged and delivered as a single push per receiver.
+ */
+export class TestDebounceNotifyProvider extends YStreamProvider<Env> {
+	constructor(ctx: DurableObjectState, env: Env) {
+		super(ctx, env, { notifyDebounceMs: 50 });
+	}
+
+	protected override pushToSubscriber(address: unknown, update: Uint8Array): void {
+		const { name } = address as { name: string };
+		const receiver = this.env.Y_NOTIFY_RECEIVER.get(
+			this.env.Y_NOTIFY_RECEIVER.idFromName(name),
+		);
+		this.ctx.waitUntil(receiver.onPush(update));
 	}
 }
 

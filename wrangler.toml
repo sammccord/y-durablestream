@@ -36,3 +36,15 @@ new_classes = ["TestSubscriber", "TestSqlSubscriber"]
 tag = "v2"
 new_sqlite_classes = ["TestNotifyProvider"]
 new_classes = ["TestNotifyReceiver"]
+
+[[durable_objects.bindings]]
+name = "Y_COMMIT_PROVIDER"
+class_name = "TestCommitCountProvider"
+
+[[durable_objects.bindings]]
+name = "Y_DEBOUNCE_PROVIDER"
+class_name = "TestDebounceNotifyProvider"
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["TestCommitCountProvider", "TestDebounceNotifyProvider"]

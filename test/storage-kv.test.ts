@@ -193,8 +193,10 @@ describe("DurableObjectKvStorage", () => {
 			await kvStorage.storeUpdate(update);
 
 			expect(storage.transaction).toHaveBeenCalledOnce();
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 5);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 1);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 5,
+				count: 1,
+			});
 			expect(storage.put).toHaveBeenCalledWith(
 				"ydoc:update:00000000000000000001",
 				update,
@@ -204,8 +206,7 @@ describe("DurableObjectKvStorage", () => {
 		it("increments byte count and update count", async () => {
 			// Simulate existing state: 10 bytes, 2 updates
 			storage.get.mockImplementation(async (key: string) => {
-				if (key === "ydoc:state:bytes") return 10;
-				if (key === "ydoc:state:count") return 2;
+				if (key === "ydoc:state:meta") return { bytes: 10, count: 2 };
 				return undefined;
 			});
 
@@ -213,12 +214,37 @@ describe("DurableObjectKvStorage", () => {
 			const kvStorage = new DurableObjectKvStorage(storage);
 			await kvStorage.storeUpdate(update);
 
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 13);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 3);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 13,
+				count: 3,
+			});
 			expect(storage.put).toHaveBeenCalledWith(
 				"ydoc:update:00000000000000000003",
 				update,
 			);
+		});
+
+		it("migrates legacy split counter keys to the meta key", async () => {
+			// Pre-0.9 layout: separate bytes/count keys, no meta key.
+			storage.get.mockImplementation(async (key: string) => {
+				if (key === "ydoc:state:bytes") return 10;
+				if (key === "ydoc:state:count") return 2;
+				return undefined;
+			});
+
+			const update = new Uint8Array([1, 2, 3]);
+			const kvStorage = new DurableObjectKvStorage(storage);
+			await kvStorage.storeUpdate(update);
+
+			// Legacy keys removed, merged meta written with migrated counters.
+			expect(storage.delete).toHaveBeenCalledWith([
+				"ydoc:state:bytes",
+				"ydoc:state:count",
+			]);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 13,
+				count: 3,
+			});
 		});
 
 		it("uses a transaction for atomicity", async () => {
@@ -234,9 +260,7 @@ describe("DurableObjectKvStorage", () => {
 			// Storage has 9000 bytes already, and we add a chunk that pushes it over 10KB
 			const largeUpdate = new Uint8Array(2000);
 			storage.get.mockImplementation(async (key: string) => {
-				if (key === "ydoc:state:bytes") return 9000;
-				if (key === "ydoc:state:count") return 5;
-				if (key === "ydoc:state:doc") return undefined;
+				if (key === "ydoc:state:meta") return { bytes: 9000, count: 5 };
 				return undefined;
 			});
 			storage.list.mockResolvedValue(new Map());
@@ -249,15 +273,15 @@ describe("DurableObjectKvStorage", () => {
 				"ydoc:state:doc",
 				expect.any(Uint8Array),
 			);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 0);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 0);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 0,
+				count: 0,
+			});
 		});
 
 		it("compacts when maxUpdates is exceeded", async () => {
 			storage.get.mockImplementation(async (key: string) => {
-				if (key === "ydoc:state:bytes") return 100;
-				if (key === "ydoc:state:count") return 500; // at limit
-				if (key === "ydoc:state:doc") return undefined;
+				if (key === "ydoc:state:meta") return { bytes: 100, count: 500 }; // at limit
 				return undefined;
 			});
 			storage.list.mockResolvedValue(new Map());
@@ -271,15 +295,15 @@ describe("DurableObjectKvStorage", () => {
 				"ydoc:state:doc",
 				expect.any(Uint8Array),
 			);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 0);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 0);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 0,
+				count: 0,
+			});
 		});
 
 		it("compacts with custom maxBytes threshold", async () => {
 			storage.get.mockImplementation(async (key: string) => {
-				if (key === "ydoc:state:bytes") return 500;
-				if (key === "ydoc:state:count") return 3;
-				if (key === "ydoc:state:doc") return undefined;
+				if (key === "ydoc:state:meta") return { bytes: 500, count: 3 };
 				return undefined;
 			});
 			storage.list.mockResolvedValue(new Map());
@@ -288,15 +312,15 @@ describe("DurableObjectKvStorage", () => {
 			const kvStorage = new DurableObjectKvStorage(storage, { maxBytes: 1024 });
 			await kvStorage.storeUpdate(update);
 
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 0);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 0);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 0,
+				count: 0,
+			});
 		});
 
 		it("compacts with custom maxUpdates threshold", async () => {
 			storage.get.mockImplementation(async (key: string) => {
-				if (key === "ydoc:state:bytes") return 10;
-				if (key === "ydoc:state:count") return 5; // at limit for maxUpdates=5
-				if (key === "ydoc:state:doc") return undefined;
+				if (key === "ydoc:state:meta") return { bytes: 10, count: 5 }; // at limit for maxUpdates=5
 				return undefined;
 			});
 			storage.list.mockResolvedValue(new Map());
@@ -305,8 +329,10 @@ describe("DurableObjectKvStorage", () => {
 			const kvStorage = new DurableObjectKvStorage(storage, { maxUpdates: 5 });
 			await kvStorage.storeUpdate(update);
 
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 0);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 0);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 0,
+				count: 0,
+			});
 		});
 
 		it("deletes existing update keys during compaction", async () => {
@@ -315,9 +341,7 @@ describe("DurableObjectKvStorage", () => {
 			const existingUpdate3 = createUpdateFromText("c", "3");
 
 			storage.get.mockImplementation(async (key: string) => {
-				if (key === "ydoc:state:bytes") return 99999;
-				if (key === "ydoc:state:count") return 3;
-				if (key === "ydoc:state:doc") return undefined;
+				if (key === "ydoc:state:meta") return { bytes: 99999, count: 3 };
 				return undefined;
 			});
 			storage.list.mockResolvedValue(
@@ -341,8 +365,7 @@ describe("DurableObjectKvStorage", () => {
 
 		it("does not compact when under both thresholds", async () => {
 			storage.get.mockImplementation(async (key: string) => {
-				if (key === "ydoc:state:bytes") return 100;
-				if (key === "ydoc:state:count") return 5;
+				if (key === "ydoc:state:meta") return { bytes: 100, count: 5 };
 				return undefined;
 			});
 
@@ -380,8 +403,10 @@ describe("DurableObjectKvStorage", () => {
 				"ydoc:state:doc",
 				expect.any(Uint8Array),
 			);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 0);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 0);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 0,
+				count: 0,
+			});
 		});
 
 		it("deletes existing incremental updates during commit", async () => {
@@ -415,8 +440,10 @@ describe("DurableObjectKvStorage", () => {
 				"ydoc:state:doc",
 				expect.any(Uint8Array),
 			);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:bytes", 0);
-			expect(storage.put).toHaveBeenCalledWith("ydoc:state:count", 0);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:state:meta", {
+				bytes: 0,
+				count: 0,
+			});
 		});
 
 		it("preserves document content through commit", async () => {
@@ -634,9 +661,8 @@ describe("DurableObjectKvStorage", () => {
 			expect(doc.getText("c").toString()).toBe("3");
 			expect(doc.getText("d").toString()).toBe("4");
 
-			// After auto-compaction, the update count should have been reset
-			expect(data.get("ydoc:state:count")).toBe(0);
-			expect(data.get("ydoc:state:bytes")).toBe(0);
+			// After auto-compaction, the counters should have been reset
+			expect(data.get("ydoc:state:meta")).toEqual({ bytes: 0, count: 0 });
 		});
 	});
 });

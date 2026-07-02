@@ -12,7 +12,7 @@ import {
 	writeSyncStep2,
 	writeUpdate,
 } from "y-protocols/sync";
-import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
+import { Doc, applyUpdate, encodeStateAsUpdate, mergeUpdates } from "yjs";
 
 import { BroadcastBuffer } from "./broadcast";
 import { DEFAULT_MAX_FRAME_SIZE, encodeMessage } from "./protocol";
@@ -32,8 +32,18 @@ const MESSAGE_SYNC = 0;
  */
 const EMPTY_DOC_UPDATE_BYTES = 2;
 
-/** DO storage key under which the push-subscriber registry is persisted. */
-const SUBSCRIBERS_KEY = "__yds:subscribers";
+/**
+ * Legacy (pre-0.9) DO storage key that held the entire push-subscriber
+ * registry as one value. Migrated to per-subscriber keys on first load.
+ */
+const LEGACY_SUBSCRIBERS_KEY = "__yds:subscribers";
+
+/**
+ * Per-subscriber registry key prefix: `__yds:sub:<clientId>` → address.
+ * One key per subscriber so register/deregister writes one small value
+ * instead of rewriting the whole map (O(1) instead of O(N) per call).
+ */
+const SUB_KEY_PREFIX = "__yds:sub:";
 
 /**
  * Structured transaction origin used for every applied update. Threaded
@@ -167,6 +177,27 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 */
 	private subscribers = new Map<string, unknown>();
 
+	/**
+	 * Whether any update has been stored since the last successful commit.
+	 * Gates the last-consumer-gone compaction in `onEmpty` so a read-only
+	 * subscribe/close cycle (notably every `syncOnce()` poll) doesn't pay a
+	 * full-document encode + snapshot write when nothing changed.
+	 */
+	private dirtySinceCommit = false;
+
+	/** Coalescing window for notify-push delivery (0 = immediate). */
+	private readonly notifyDebounceMs: number;
+
+	/** Updates awaiting a coalesced notify-push flush (`notifyDebounceMs > 0`). */
+	private pendingNotify: {
+		updates: Uint8Array[];
+		origins: Set<string | undefined>;
+		keys: Set<string | undefined>;
+	} | null = null;
+
+	/** Pending coalesced-notify timer, if one is armed. */
+	private notifyTimer: ReturnType<typeof setTimeout> | null = null;
+
 	// ═════════════════════════════════════
 	// Configurable thresholds
 	// ═════════════════════════════════════
@@ -208,16 +239,25 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		if (options?.maxBytes !== undefined) this.maxBytes = options.maxBytes;
 		if (options?.maxUpdates !== undefined) this.maxUpdates = options.maxUpdates;
 		this.frameChunkSize = options?.frameChunkSize ?? DEFAULT_MAX_FRAME_SIZE;
+		this.notifyDebounceMs = options?.notifyDebounceMs ?? 0;
 		this.broadcast = new BroadcastBuffer({
 			highWaterMark: options?.streamHighWaterMark ?? 64,
 			backpressure: options?.backpressure ?? "resync",
 			onEmpty: () => {
-				// Compact storage once no subscribers remain.  Tie it to
-				// the DO lifetime via waitUntil so it isn't dropped if the
-				// object is evicted, and never let a storage failure surface
-				// as an unhandled rejection.
+				// Compact storage once no subscribers remain — but only when
+				// something was actually written since the last commit.  Every
+				// one-shot `syncOnce()` ends here, so an unconditional commit
+				// would pay a full-document encode + snapshot write per poll.
+				// (Updates that predate this isolate are still compacted by the
+				// storeUpdate thresholds; skipping here only defers, never loses.)
+				if (!this.dirtySinceCommit) return;
+				this.dirtySinceCommit = false;
+				// Tie it to the DO lifetime via waitUntil so it isn't dropped
+				// if the object is evicted, and never let a storage failure
+				// surface as an unhandled rejection.
 				this.ctx.waitUntil(
 					this.storage.commit(this.doc).catch((err) => {
+						this.dirtySinceCommit = true;
 						this.onStorageError(err);
 					}),
 				);
@@ -281,9 +321,26 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 			applyUpdate(this.doc, state);
 		}
 
-		// Restore the push-subscriber registry persisted across evictions.
-		const savedSubs = await this.ctx.storage.get<Record<string, unknown>>(SUBSCRIBERS_KEY);
-		if (savedSubs) this.subscribers = new Map(Object.entries(savedSubs));
+		// Restore the push-subscriber registry persisted across evictions
+		// (one key per subscriber; see SUB_KEY_PREFIX).
+		const savedSubs = await this.ctx.storage.list({ prefix: SUB_KEY_PREFIX });
+		for (const [key, address] of savedSubs) {
+			this.subscribers.set(key.slice(SUB_KEY_PREFIX.length), address);
+		}
+
+		// One-time migration from the pre-0.9 whole-map layout.
+		const legacySubs = await this.ctx.storage.get<Record<string, unknown>>(
+			LEGACY_SUBSCRIBERS_KEY,
+		);
+		if (legacySubs) {
+			const entries: Record<string, unknown> = {};
+			for (const [clientId, address] of Object.entries(legacySubs)) {
+				if (!this.subscribers.has(clientId)) this.subscribers.set(clientId, address);
+				entries[SUB_KEY_PREFIX + clientId] = address;
+			}
+			await this.ctx.storage.put(entries);
+			await this.ctx.storage.delete(LEGACY_SUBSCRIBERS_KEY);
+		}
 
 		this.doc.on("update", (update: Uint8Array, origin: unknown) => {
 			// `origin` is the BroadcastOrigin passed to readSyncMessage/applyUpdate
@@ -448,14 +505,26 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 */
 	async register(clientId: string, address: unknown): Promise<void> {
 		this.subscribers.set(clientId, address);
-		await this.ctx.storage.put(SUBSCRIBERS_KEY, Object.fromEntries(this.subscribers));
+		await this.ctx.storage.put(SUB_KEY_PREFIX + clientId, address);
 	}
 
 	/** Remove a push-subscriber registered via {@link register}. Idempotent. */
 	async deregister(clientId: string): Promise<void> {
 		if (this.subscribers.delete(clientId)) {
-			await this.ctx.storage.put(SUBSCRIBERS_KEY, Object.fromEntries(this.subscribers));
+			await this.ctx.storage.delete(SUB_KEY_PREFIX + clientId);
 		}
+	}
+
+	/**
+	 * Drop any live stream consumers created by {@link subscribe} with this
+	 * `clientId`. Workerd tears down an RPC-boundary stream as a connection
+	 * loss without invoking the provider-side cancel callback, so a subscriber
+	 * that just cancels (or drops) its stream leaves its consumer registered
+	 * here until eviction. {@link YStreamClient} calls this automatically after
+	 * every stream teardown and `syncOnce`. Idempotent.
+	 */
+	async unsubscribe(clientId: string): Promise<void> {
+		this.broadcast.removeByClientId(clientId);
 	}
 
 	// ═════════════════════════════════════
@@ -476,6 +545,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	private handleDocUpdate(update: Uint8Array, originId?: string, key?: string): void {
 		this.broadcastUpdate(update, originId, key);
 		this.notifySubscribers(update, originId, key);
+		this.dirtySinceCommit = true;
 		this.ctx.waitUntil(
 			this.storage.storeUpdate(update).catch((err) => {
 				this.onStorageError(err);
@@ -490,9 +560,62 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * subscribers holding an open stream, this reaches Durable Object subscribers
 	 * that have no live stream (their read-loop ended with their request) and
 	 * must be RPC-ed instead. Each delivery goes through {@link pushToSubscriber}.
+	 *
+	 * With `notifyDebounceMs > 0`, updates applied within the window are merged
+	 * (`Y.mergeUpdates`) and delivered as one push per subscriber per window
+	 * instead of one per update — see {@link YStreamProviderOptions.notifyDebounceMs}
+	 * for the echo/key semantics of coalesced delivery.
 	 */
 	private notifySubscribers(update: Uint8Array, originId?: string, key?: string): void {
 		if (this.subscribers.size === 0) return;
+
+		if (this.notifyDebounceMs <= 0) {
+			this.deliverToSubscribers(update, originId, key);
+			return;
+		}
+
+		this.pendingNotify ??= { updates: [], origins: new Set(), keys: new Set() };
+		this.pendingNotify.updates.push(update);
+		this.pendingNotify.origins.add(originId);
+		this.pendingNotify.keys.add(key);
+
+		if (this.notifyTimer === null) {
+			// Tie the flush to the DO lifetime so a hibernation-bound eviction
+			// waits for the coalesced delivery instead of dropping it.
+			this.ctx.waitUntil(
+				new Promise<void>((resolve) => {
+					this.notifyTimer = setTimeout(() => {
+						this.notifyTimer = null;
+						try {
+							this.flushNotify();
+						} finally {
+							resolve();
+						}
+					}, this.notifyDebounceMs);
+				}),
+			);
+		}
+	}
+
+	/** Merge and deliver all pending coalesced notify-push updates. */
+	private flushNotify(): void {
+		const pending = this.pendingNotify;
+		this.pendingNotify = null;
+		if (!pending || pending.updates.length === 0) return;
+
+		const merged =
+			pending.updates.length === 1 ? pending.updates[0] : mergeUpdates(pending.updates);
+		// Echo suppression / key routing only survive coalescing when they are
+		// uniform across the window; otherwise deliver to all with no key.
+		// A subscriber re-applying its own update is a no-op in Yjs.
+		const soleOrigin =
+			pending.origins.size === 1 ? pending.origins.values().next().value : undefined;
+		const soleKey = pending.keys.size === 1 ? pending.keys.values().next().value : undefined;
+		this.deliverToSubscribers(merged, soleOrigin, soleKey);
+	}
+
+	/** Push one (possibly merged) update to every non-origin registered subscriber. */
+	private deliverToSubscribers(update: Uint8Array, originId?: string, key?: string): void {
 		for (const [clientId, address] of this.subscribers) {
 			if (clientId === originId) continue; // do not echo a subscriber's own write
 			try {

@@ -6,6 +6,8 @@ import type { TestSqlProvider } from "./worker";
 import type { TestSqlSubscriber } from "./worker";
 import type { TestNotifyProvider } from "./worker";
 import type { TestNotifyReceiver } from "./worker";
+import type { TestCommitCountProvider } from "./worker";
+import type { TestDebounceNotifyProvider } from "./worker";
 
 interface CloudflareEnv {
 	Y_STREAM_PROVIDER: DurableObjectNamespace<TestProvider>;
@@ -14,6 +16,8 @@ interface CloudflareEnv {
 	Y_SQL_SUBSCRIBER: DurableObjectNamespace<TestSqlSubscriber>;
 	Y_NOTIFY_PROVIDER: DurableObjectNamespace<TestNotifyProvider>;
 	Y_NOTIFY_RECEIVER: DurableObjectNamespace<TestNotifyReceiver>;
+	Y_COMMIT_PROVIDER: DurableObjectNamespace<TestCommitCountProvider>;
+	Y_DEBOUNCE_PROVIDER: DurableObjectNamespace<TestDebounceNotifyProvider>;
 }
 
 declare module "cloudflare:test" {

@@ -34,9 +34,6 @@ interface DurableObjectState {
 	readonly storage: DurableObjectStorage;
 	waitUntil(promise: Promise<unknown>): void;
 	blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T>;
-	acceptWebSocket(ws: WebSocket, tags?: string[]): void;
-	getWebSockets(tag?: string): WebSocket[];
-	getTags(ws: WebSocket): string[];
 	abort(reason?: string): void;
 }
 
@@ -128,12 +125,6 @@ declare class ReadableStream<R = unknown> {
 		strategy?: QueuingStrategy<R>,
 	);
 	getReader(): ReadableStreamDefaultReader<R>;
-	pipeThrough<T>(
-		transform: { writable: WritableStream<R>; readable: ReadableStream<T> },
-		options?: StreamPipeOptions,
-	): ReadableStream<T>;
-	pipeTo(destination: WritableStream<R>, options?: StreamPipeOptions): Promise<void>;
-	tee(): [ReadableStream<R>, ReadableStream<R>];
 	cancel(reason?: unknown): Promise<void>;
 	readonly locked: boolean;
 
@@ -153,38 +144,6 @@ type ReadableStreamReadResult<T> =
 	| { done: false; value: T }
 	| { done: true; value?: undefined };
 
-declare class WritableStream<W = unknown> {
-	constructor(
-		underlyingSink?: UnderlyingSink<W>,
-		strategy?: QueuingStrategy<W>,
-	);
-	getWriter(): WritableStreamDefaultWriter<W>;
-	close(): Promise<void>;
-	abort(reason?: unknown): Promise<void>;
-	readonly locked: boolean;
-}
-
-declare class WritableStreamDefaultWriter<W = unknown> {
-	constructor(stream: WritableStream<W>);
-	write(chunk: W): Promise<void>;
-	close(): Promise<void>;
-	abort(reason?: unknown): Promise<void>;
-	releaseLock(): void;
-	readonly closed: Promise<undefined>;
-	readonly ready: Promise<undefined>;
-	readonly desiredSize: number | null;
-}
-
-declare class TransformStream<I = unknown, O = unknown> {
-	constructor(
-		transformer?: Transformer<I, O>,
-		writableStrategy?: QueuingStrategy<I>,
-		readableStrategy?: QueuingStrategy<O>,
-	);
-	readonly readable: ReadableStream<O>;
-	readonly writable: WritableStream<I>;
-}
-
 interface UnderlyingSource<R = unknown> {
 	start?(controller: ReadableStreamDefaultController<R>): void | Promise<void>;
 	pull?(controller: ReadableStreamDefaultController<R>): void | Promise<void>;
@@ -199,60 +158,7 @@ interface ReadableStreamDefaultController<R = unknown> {
 	readonly desiredSize: number | null;
 }
 
-interface UnderlyingSink<W = unknown> {
-	start?(controller: WritableStreamDefaultController): void | Promise<void>;
-	write?(chunk: W, controller: WritableStreamDefaultController): void | Promise<void>;
-	close?(controller: WritableStreamDefaultController): void | Promise<void>;
-	abort?(reason?: unknown): void | Promise<void>;
-	type?: undefined;
-}
-
-interface WritableStreamDefaultController {
-	error(e?: unknown): void;
-	readonly signal: AbortSignal;
-}
-
-interface Transformer<I = unknown, O = unknown> {
-	start?(controller: TransformStreamDefaultController<O>): void | Promise<void>;
-	transform?(chunk: I, controller: TransformStreamDefaultController<O>): void | Promise<void>;
-	flush?(controller: TransformStreamDefaultController<O>): void | Promise<void>;
-	readableType?: undefined;
-	writableType?: undefined;
-}
-
-interface TransformStreamDefaultController<O = unknown> {
-	enqueue(chunk: O): void;
-	error(reason?: unknown): void;
-	terminate(): void;
-	readonly desiredSize: number | null;
-}
-
-interface StreamPipeOptions {
-	preventClose?: boolean;
-	preventAbort?: boolean;
-	preventCancel?: boolean;
-	signal?: AbortSignal;
-}
-
 interface QueuingStrategy<T = unknown> {
 	highWaterMark?: number;
 	size?(chunk: T): number;
-}
-
-// ═══════════════════════════════════════════════════════════
-// Additional globals used by the source but not in "ESNext"
-// ═══════════════════════════════════════════════════════════
-
-declare class TextEncoder {
-	encode(input?: string): Uint8Array;
-	encodeInto(input: string, dest: Uint8Array): { read: number; written: number };
-	readonly encoding: string;
-}
-
-declare class TextDecoder {
-	constructor(label?: string, options?: { fatal?: boolean; ignoreBOM?: boolean });
-	decode(input?: ArrayBufferView | ArrayBuffer, options?: { stream?: boolean }): string;
-	readonly encoding: string;
-	readonly fatal: boolean;
-	readonly ignoreBOM: boolean;
 }

@@ -57,6 +57,19 @@ export interface YStreamProviderStub {
 
 	/** Remove a push-subscriber registered via {@link register}. Idempotent. */
 	deregister(clientId: string): Promise<void>;
+
+	/**
+	 * Drop any live stream consumers created by {@link subscribe} calls with
+	 * this `clientId`. Workerd does not propagate a `ReadableStream.cancel()`
+	 * across the RPC boundary to the provider's cancel callback — a dropped or
+	 * cancelled subscriber stream just dies as a connection loss, leaving its
+	 * consumer registered until the provider DO is evicted. Clients call this
+	 * after ending a stream (`YStreamClient` does it automatically) so the
+	 * provider can clean up deterministically. Idempotent.
+	 *
+	 * Optional so stubs generated against pre-0.9 providers still typecheck.
+	 */
+	unsubscribe?(clientId: string): Promise<void>;
 }
 
 /**
@@ -133,6 +146,15 @@ export interface YStreamClientOptions {
 	 * interest); updates with no key broadcast to all.
 	 */
 	interest?: string[];
+
+	/**
+	 * Called when a background send to the provider fails (a fire-and-forget
+	 * `stub.update` from the doc `update` handler or a SyncStep reply). Without
+	 * this hook such failures are logged; they never become unhandled promise
+	 * rejections. The failed update is not retried — the next SyncStep1/2
+	 * handshake (reconnect or `syncOnce`) recovers any missed state.
+	 */
+	onError?: (error: unknown) => void;
 }
 
 /**
@@ -215,4 +237,24 @@ export interface YStreamProviderOptions {
 	 * @default 1048576 (1 MB)
 	 */
 	frameChunkSize?: number;
+
+	/**
+	 * Coalescing window (ms) for notify-push delivery to registered
+	 * subscribers. With the default `0`, every applied update is delivered to
+	 * each registered subscriber immediately (one `pushToSubscriber` call per
+	 * update per subscriber). With a positive value, updates applied within the
+	 * window are merged via `Y.mergeUpdates` and delivered as one push per
+	 * subscriber per window — the lever for cutting per-update RPC wake-ups
+	 * (each a billed request) to hibernating Durable Object subscribers.
+	 *
+	 * Coalesced delivery drops per-update echo suppression and interest keys:
+	 * the merged update goes to every registered subscriber with `key`
+	 * `undefined` unless every update in the window shares one key, and a
+	 * subscriber is skipped only when it originated *all* updates in the
+	 * window. Applying an update a subscriber already has is a harmless no-op
+	 * in Yjs, so this trades a little redundant delivery for far fewer wakes.
+	 *
+	 * @default 0 (immediate, uncoalesced)
+	 */
+	notifyDebounceMs?: number;
 }

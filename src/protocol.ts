@@ -293,7 +293,10 @@ export function createMessageDecoder(options?: FrameDecoderOptions): MessageDeco
 				have++;
 			}
 			if (total > 0 && have === total) {
-				messages.push(concatParts(parts as Uint8Array[]));
+				// Single-part fast path (every incremental update): the part is
+				// already a view over this frame's own decoded copy, so hand it
+				// out directly instead of concat-copying it again.
+				messages.push(total === 1 ? (parts[0] as Uint8Array) : concatParts(parts as Uint8Array[]));
 				parts = [];
 				total = 0;
 				have = 0;

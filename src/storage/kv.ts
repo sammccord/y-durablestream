@@ -8,9 +8,21 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_UPDATES } from "./types";
 // ═══════════════════════════════════════════════════════════
 
 const STATE_DOC_KEY = "ydoc:state:doc";
-const STATE_BYTES_KEY = "ydoc:state:bytes";
-const STATE_COUNT_KEY = "ydoc:state:count";
+/**
+ * Single meta key holding both compaction counters. One get + one put per
+ * stored update instead of two of each with the legacy split keys.
+ */
+const STATE_META_KEY = "ydoc:state:meta";
+/** Legacy (pre-0.9) split counter keys; migrated to STATE_META_KEY on first write. */
+const LEGACY_BYTES_KEY = "ydoc:state:bytes";
+const LEGACY_COUNT_KEY = "ydoc:state:count";
 const UPDATE_KEY_PREFIX = "ydoc:update:";
+
+/** Value stored under {@link STATE_META_KEY}. */
+interface StateMeta {
+	bytes: number;
+	count: number;
+}
 /**
  * Zero-pad the update index so that `list({ prefix })`, which returns
  * keys in lexicographic order, yields updates in numeric insertion order
@@ -55,9 +67,11 @@ interface KvTransactionLike {
  * | Key                     | Value                                 |
  * |-------------------------|---------------------------------------|
  * | `ydoc:state:doc`        | `Uint8Array` — compacted doc snapshot |
- * | `ydoc:state:bytes`      | `number` — total incremental bytes    |
- * | `ydoc:state:count`      | `number` — number of incremental updates |
+ * | `ydoc:state:meta`       | `{ bytes, count }` — compaction counters |
  * | `ydoc:update:<n>`       | `Uint8Array` — incremental update `n` |
+ *
+ * (Pre-0.9 layouts with split `ydoc:state:bytes` / `ydoc:state:count` keys
+ * are migrated to `ydoc:state:meta` on the first write.)
  *
  * ## Usage
  *
@@ -115,8 +129,7 @@ export class DurableObjectKvStorage implements YDocStorage {
 
 	async storeUpdate(update: Uint8Array): Promise<void> {
 		await this.storage.transaction(async (tx) => {
-			const bytes = (await tx.get<number>(STATE_BYTES_KEY)) ?? 0;
-			const count = (await tx.get<number>(STATE_COUNT_KEY)) ?? 0;
+			const { bytes, count } = await this.loadMeta(tx);
 
 			const newBytes = bytes + update.byteLength;
 			const newCount = count + 1;
@@ -129,8 +142,8 @@ export class DurableObjectKvStorage implements YDocStorage {
 				applyUpdate(doc, update);
 				await this.compactInTransaction(tx, doc);
 			} else {
-				await tx.put(STATE_BYTES_KEY, newBytes);
-				await tx.put(STATE_COUNT_KEY, newCount);
+				// Common path: 1 get (meta) + 2 puts.
+				await tx.put<StateMeta>(STATE_META_KEY, { bytes: newBytes, count: newCount });
 				await tx.put(updateKey(newCount), update);
 			}
 		});
@@ -145,6 +158,25 @@ export class DurableObjectKvStorage implements YDocStorage {
 	// ═════════════════════════════════════
 	// Internal helpers
 	// ═════════════════════════════════════
+
+	/**
+	 * Read the compaction counters, falling back to (and migrating away
+	 * from) the legacy pre-0.9 split keys the first time they are seen.
+	 */
+	private async loadMeta(tx: KvTransactionLike): Promise<StateMeta> {
+		const meta = await tx.get<StateMeta>(STATE_META_KEY);
+		if (meta) return meta;
+
+		const bytes = await tx.get<number>(LEGACY_BYTES_KEY);
+		const count = await tx.get<number>(LEGACY_COUNT_KEY);
+		if (bytes === undefined && count === undefined) {
+			return { bytes: 0, count: 0 };
+		}
+		// One-time migration: drop the split keys; the caller writes the
+		// merged meta key within this same transaction.
+		await tx.delete([LEGACY_BYTES_KEY, LEGACY_COUNT_KEY]);
+		return { bytes: bytes ?? 0, count: count ?? 0 };
+	}
 
 	/**
 	 * Rebuild a `Doc` from the snapshot and incremental updates
@@ -190,7 +222,6 @@ export class DurableObjectKvStorage implements YDocStorage {
 		}
 
 		await tx.put(STATE_DOC_KEY, encodeStateAsUpdate(doc));
-		await tx.put(STATE_BYTES_KEY, 0);
-		await tx.put(STATE_COUNT_KEY, 0);
+		await tx.put<StateMeta>(STATE_META_KEY, { bytes: 0, count: 0 });
 	}
 }

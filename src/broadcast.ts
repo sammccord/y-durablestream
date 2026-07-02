@@ -55,6 +55,15 @@ interface ConsumerState {
 	controller: ReadableStreamDefaultController<Uint8Array> | null;
 	/** Whether the consumer has been cancelled. */
 	cancelled: boolean;
+	/**
+	 * Wall-clock timestamp of the backpressure resync that this consumer has
+	 * not yet pulled past, or `null` when it is keeping up. A consumer whose
+	 * stream died without the cancel callback firing (workerd RPC teardown)
+	 * never pulls again: it re-laps the high-water mark with this still set,
+	 * and once it has been set for longer than the stale TTL the consumer is
+	 * declared dead and removed.
+	 */
+	resyncPendingSince: number | null;
 }
 
 // ─── Public types ───────────────────────────────────────────────
@@ -125,6 +134,18 @@ export interface BroadcastBufferOptions {
 	 * the rebuilt snapshot is scoped to what that consumer actually wants.
 	 */
 	onResync?: (interest: Set<string> | null) => Uint8Array[];
+
+	/**
+	 * How long (ms of wall-clock time) a lagging consumer may sit on an
+	 * undrained backpressure resync before it is declared dead and removed.
+	 * Guards against consumers whose stream was torn down across the RPC
+	 * boundary without the cancel callback firing — they never pull again and
+	 * would otherwise stay registered (and re-trigger resync snapshot builds)
+	 * until the Durable Object is evicted. A healthy-but-slow consumer is
+	 * unaffected: any pull clears the pending state.
+	 * @default 30000
+	 */
+	staleConsumerTtlMs?: number;
 }
 
 // ─── Implementation ─────────────────────────────────────────────
@@ -146,12 +167,14 @@ export class BroadcastBuffer {
 	private readonly backpressure: BackpressurePolicy;
 	private readonly onEmpty?: () => void;
 	private readonly onResync?: (interest: Set<string> | null) => Uint8Array[];
+	private readonly staleConsumerTtlMs: number;
 
 	constructor(options?: BroadcastBufferOptions) {
 		this.highWaterMark = options?.highWaterMark ?? 64;
 		this.backpressure = options?.backpressure ?? "resync";
 		this.onEmpty = options?.onEmpty;
 		this.onResync = options?.onResync;
+		this.staleConsumerTtlMs = options?.staleConsumerTtlMs ?? 30_000;
 	}
 
 	// ── Producer API ──────────────────────────────────────────────
@@ -238,6 +261,7 @@ export class BroadcastBuffer {
 			resolver: null,
 			controller: null,
 			cancelled: false,
+			resyncPendingSince: null,
 		};
 
 		this.consumers.set(id, state);
@@ -250,6 +274,9 @@ export class BroadcastBuffer {
 			},
 
 			async pull(controller) {
+				// Any pull proves the consumer is alive — clear the stale marker.
+				state.resyncPendingSince = null;
+
 				// 1. Drain per-consumer initial frames first.
 				if (state.initialFrames.length > 0) {
 					const frame = state.initialFrames.shift()!;
@@ -353,6 +380,26 @@ export class BroadcastBuffer {
 	}
 
 	/**
+	 * Remove every consumer created with the given `clientId`.
+	 *
+	 * This is the deterministic cleanup path for subscriber streams whose
+	 * teardown does not reach the ReadableStream cancel callback (workerd
+	 * drops RPC-boundary streams as a connection loss without cancelling).
+	 * Returns the number of consumers removed. Idempotent.
+	 */
+	removeByClientId(clientId: string): number {
+		let removed = 0;
+		// Snapshot values: removeConsumer mutates the map.
+		for (const consumer of [...this.consumers.values()]) {
+			if (consumer.clientId === clientId) {
+				this.removeConsumer(consumer.id);
+				removed++;
+			}
+		}
+		return removed;
+	}
+
+	/**
 	 * Number of frames currently retained in the shared buffer.
 	 *
 	 * Exposed for diagnostics and tests — under the `"resync"` and
@@ -421,6 +468,11 @@ export class BroadcastBuffer {
 
 		if (lagging.length === 0) return;
 
+		// The full-sync (null-interest) snapshot is identical for every lagging
+		// consumer, so build it at most once per pass. Interest-scoped snapshots
+		// stay per-consumer (each set may differ).
+		let fullSyncFrames: Uint8Array[] | null = null;
+
 		for (const consumer of lagging) {
 			if (this.backpressure === "error") {
 				// Disconnect the slow consumer.
@@ -435,11 +487,35 @@ export class BroadcastBuffer {
 				continue;
 			}
 
+			// A consumer that re-lapped the high-water mark while an earlier
+			// resync burst sits undrained has not pulled since that resync.
+			// Past the stale TTL that means its stream is gone (RPC teardown
+			// never fires the cancel callback) — remove it instead of
+			// rebuilding snapshots for it forever. Wall-clock only advances
+			// across I/O in workerd, so a synchronous push burst can never
+			// trip this for a healthy consumer.
+			if (consumer.resyncPendingSince !== null) {
+				if (Date.now() - consumer.resyncPendingSince > this.staleConsumerTtlMs) {
+					this.removeConsumer(consumer.id);
+					continue;
+				}
+			} else {
+				consumer.resyncPendingSince = Date.now();
+			}
+
 			// "resync": fast-forward the consumer to the buffer head and
 			// hand it a fresh full-state snapshot.  Dropping its claim on
 			// the old frames lets the buffer be trimmed (bounding memory),
 			// and the snapshot guarantees convergence with no lost deltas.
-			consumer.initialFrames = this.onResync ? this.onResync(consumer.interest) : [];
+			if (!this.onResync) {
+				consumer.initialFrames = [];
+			} else if (consumer.interest === null) {
+				fullSyncFrames ??= this.onResync(null);
+				// Fresh array per consumer — initialFrames is drained via shift().
+				consumer.initialFrames = [...fullSyncFrames];
+			} else {
+				consumer.initialFrames = this.onResync(consumer.interest);
+			}
 			consumer.cursor = head;
 		}
 

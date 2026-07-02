@@ -143,34 +143,33 @@ export class YStreamClient {
 	 */
 	private didSync = false;
 
+	/**
+	 * Resolves the reconnect backoff sleep early (clearing its timer) so
+	 * {@link disconnect} doesn't leave `connect()` pending for up to
+	 * `maxDelay` waiting out a backoff that no longer matters.
+	 */
+	private wakeReconnect: (() => void) | null = null;
+
+	/** Error hook for background send failures (see {@link YStreamClientOptions.onError}). */
+	private readonly onError: (error: unknown) => void;
+
 	constructor(doc: Doc, options: YStreamClientOptions) {
 		this.doc = doc;
 		this.stub = options.stub;
 		this.clientId = options.clientId ?? generateClientId();
 		this.maxFrameSize = options.maxFrameSize;
 		this.interest = options.interest;
-		this.reconnectOptions = options.reconnect
+		this.onError =
+			options.onError ??
+			((error) => console.error("[y-durablestream] send to provider failed:", error));
+		const reconnect = options.reconnect;
+		const overrides = typeof reconnect === "object" ? reconnect : undefined;
+		this.reconnectOptions = reconnect
 			? {
-					maxRetries:
-						typeof options.reconnect === "object" &&
-						options.reconnect.maxRetries !== undefined
-							? options.reconnect.maxRetries
-							: Infinity,
-					initialDelay:
-						typeof options.reconnect === "object" &&
-						options.reconnect.initialDelay !== undefined
-							? options.reconnect.initialDelay
-							: 100,
-					maxDelay:
-						typeof options.reconnect === "object" &&
-						options.reconnect.maxDelay !== undefined
-							? options.reconnect.maxDelay
-							: 30_000,
-					backoffMultiplier:
-						typeof options.reconnect === "object" &&
-						options.reconnect.backoffMultiplier !== undefined
-							? options.reconnect.backoffMultiplier
-							: 2,
+					maxRetries: overrides?.maxRetries ?? Infinity,
+					initialDelay: overrides?.initialDelay ?? 100,
+					maxDelay: overrides?.maxDelay ?? 30_000,
+					backoffMultiplier: overrides?.backoffMultiplier ?? 2,
 				}
 			: null;
 	}
@@ -207,6 +206,12 @@ export class YStreamClient {
 
 	/**
 	 * Register a listener that fires whenever the client status changes.
+	 *
+	 * Listeners intentionally survive `disconnect()`/reconnect cycles so a
+	 * single registration observes the whole lifecycle. They are only
+	 * removed via the returned unsubscribe function — call it when done
+	 * with the client, or the listener keeps the client (and its captures)
+	 * reachable.
 	 *
 	 * @param handler Callback receiving the new status.
 	 * @returns An unsubscribe function.
@@ -270,12 +275,24 @@ export class YStreamClient {
 			if (attempt >= opts.maxRetries) return;
 
 			// Wait with exponential backoff before the next attempt.
+			// disconnect() wakes this sleep early (and clears the timer) so
+			// the connect() promise doesn't stay pending for up to maxDelay.
 			this.setStatus("reconnecting");
 			const delay = Math.min(
 				opts.initialDelay * Math.pow(opts.backoffMultiplier, attempt),
 				opts.maxDelay,
 			);
-			await new Promise<void>((r) => setTimeout(r, delay));
+			await new Promise<void>((resolve) => {
+				const timer = setTimeout(() => {
+					this.wakeReconnect = null;
+					resolve();
+				}, delay);
+				this.wakeReconnect = () => {
+					clearTimeout(timer);
+					this.wakeReconnect = null;
+					resolve();
+				};
+			});
 
 			// disconnect() may have been called while we were sleeping.
 			if (this._disposed) {
@@ -333,12 +350,20 @@ export class YStreamClient {
 
 		// Send our own SyncStep1 to the provider so it knows what we
 		// already have.  The provider will respond with a SyncStep2 if
-		// we had data it was missing.
-		this.sendSyncStep1();
+		// we had data it was missing.  Fire-and-forget: a failure here is
+		// recovered by the next handshake, but must not become an
+		// unhandled rejection.
+		this.sendSyncStep1().catch(this.onError);
 
 		// Enter the read loop — this runs until the stream ends or we
 		// disconnect.  readLoop() always resolves (never rejects).
 		await this.readLoop(stream);
+
+		// Drop our consumer on the provider: stream teardown across the RPC
+		// boundary never reaches the provider's cancel callback, so without
+		// this the consumer stays registered until the provider DO is
+		// evicted. Awaited so a reconnect's fresh subscribe() cannot race it.
+		await this.safeUnsubscribe();
 
 		// Clean up resources after the read loop exits.
 		// This is the ONLY place teardown is called during an active
@@ -379,6 +404,10 @@ export class YStreamClient {
 		if (this.stream) {
 			this.stream.cancel().catch(() => {});
 		}
+
+		// Wake a pending reconnect backoff sleep so the connect() loop can
+		// observe _disposed and resolve now rather than after the delay.
+		this.wakeReconnect?.();
 	}
 
 	// ═════════════════════════════════════
@@ -431,7 +460,7 @@ export class YStreamClient {
 		// If processing a SyncStep1 produced a SyncStep2 response,
 		// send it back to the provider.
 		if (reply) {
-			void this.stub.update(reply, this.clientId);
+			this.stub.update(reply, this.clientId).catch(this.onError);
 		}
 
 		// Transition to "synced" after receiving SyncStep2.
@@ -509,8 +538,24 @@ export class YStreamClient {
 		} catch {
 			// stream error / cancellation — best-effort one-shot
 		} finally {
-			// Breaking out of `for await` cancels the stream iterator.
+			// Breaking out of `for await` cancels the stream iterator locally,
+			// but the cancel does not reach the provider across the RPC
+			// boundary — tell it explicitly so our consumer is removed.
+			await this.safeUnsubscribe();
 			decoder.reset();
+		}
+	}
+
+	/**
+	 * Ask the provider to drop this client's stream consumers. Tolerates
+	 * pre-0.9 providers (no `unsubscribe` RPC) and unreachable providers —
+	 * in both cases there is nothing further to clean up from here.
+	 */
+	private async safeUnsubscribe(): Promise<void> {
+		try {
+			await this.stub.unsubscribe?.(this.clientId);
+		} catch {
+			// Provider unreachable/evicted — its consumer state is gone anyway.
 		}
 	}
 
@@ -545,7 +590,7 @@ export class YStreamClient {
 		const encoder = createEncoder();
 		writeVarUint(encoder, MESSAGE_SYNC);
 		writeUpdate(encoder, update);
-		void this.stub.update(toUint8Array(encoder), this.clientId, key);
+		this.stub.update(toUint8Array(encoder), this.clientId, key).catch(this.onError);
 	}
 
 	/**
