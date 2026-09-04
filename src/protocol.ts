@@ -281,7 +281,9 @@ export function createMessageDecoder(options?: FrameDecoderOptions): MessageDeco
 
 			if (index === 0) {
 				// Start of a message — discard any incomplete prior assembly.
-				parts = new Array(partTotal);
+				// Grown by assignment rather than preallocated: partTotal comes
+				// off the wire unbounded, and `total` already tracks the count.
+				parts = [];
 				total = partTotal;
 				have = 0;
 			} else if (partTotal !== total || index >= total || parts.length === 0) {

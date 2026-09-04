@@ -1,5 +1,3 @@
-import type { Doc } from "yjs";
-
 /**
  * The RPC surface exposed by a YStreamProvider Durable Object.
  * This is the interface that client stubs conform to.

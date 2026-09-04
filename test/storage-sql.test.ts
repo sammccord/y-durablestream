@@ -3,10 +3,8 @@ import { describe, it, expect } from "vitest";
 import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
 
 import { YStreamProvider } from "../src/provider";
-import { DurableObjectSqlStorage } from "../src/storage/sql";
 
 import type { TestSqlProvider } from "./worker";
-import type { TestSqlSubscriber } from "./worker";
 
 // ──────────────────────────────────────────────────────────
 // Helpers

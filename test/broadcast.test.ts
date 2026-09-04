@@ -366,3 +366,48 @@ describe("BroadcastBuffer interest filtering", () => {
     void reader;
   });
 });
+
+describe("BroadcastBuffer removeByClientId", () => {
+	it("removes every consumer sharing the clientId and reports the count", () => {
+		const buf = new BroadcastBuffer();
+		buf.createConsumer(undefined, "a");
+		buf.createConsumer(undefined, "a");
+		buf.createConsumer(undefined, "b");
+
+		expect(buf.removeByClientId("a")).toBe(2);
+		expect(buf.consumerCount).toBe(1);
+	});
+
+	it("is idempotent", () => {
+		const buf = new BroadcastBuffer();
+		buf.createConsumer(undefined, "a");
+
+		expect(buf.removeByClientId("a")).toBe(1);
+		expect(buf.removeByClientId("a")).toBe(0);
+		expect(buf.consumerCount).toBe(0);
+	});
+
+	it("ignores consumers registered without a clientId", () => {
+		const buf = new BroadcastBuffer();
+		buf.createConsumer();
+
+		expect(buf.removeByClientId("a")).toBe(0);
+		expect(buf.consumerCount).toBe(1);
+	});
+
+	it("does not remove a consumer that onEmpty registers mid-removal", () => {
+		let readded = false;
+		const buf: BroadcastBuffer = new BroadcastBuffer({
+			onEmpty: () => {
+				if (readded) return;
+				readded = true;
+				buf.createConsumer(undefined, "a");
+			},
+		});
+		buf.createConsumer(undefined, "a");
+		buf.createConsumer(undefined, "a");
+
+		expect(buf.removeByClientId("a")).toBe(2);
+		expect(buf.consumerCount).toBe(1);
+	});
+});

@@ -266,14 +266,12 @@ export class BroadcastBuffer {
 
 		this.consumers.set(id, state);
 
-		const self = this;
-
 		const readable = new ReadableStream<Uint8Array>({
-			start(controller) {
+			start: (controller) => {
 				state.controller = controller;
 			},
 
-			async pull(controller) {
+			pull: async (controller) => {
 				// Any pull proves the consumer is alive — clear the stale marker.
 				state.resyncPendingSince = null;
 
@@ -289,8 +287,8 @@ export class BroadcastBuffer {
 				//    trim after it even when nothing is delivered — otherwise a
 				//    consumer that skips everything would advance its cursor but
 				//    never let the buffer reclaim those frames.
-				let frame = self.takeNext(state);
-				self.tryTrimBuffer();
+				let frame = this.takeNext(state);
+				this.tryTrimBuffer();
 				if (frame !== null) {
 					controller.enqueue(frame);
 					return;
@@ -302,15 +300,15 @@ export class BroadcastBuffer {
 				});
 				if (state.cancelled) return;
 
-				frame = self.takeNext(state);
-				self.tryTrimBuffer();
+				frame = this.takeNext(state);
+				this.tryTrimBuffer();
 				if (frame !== null) {
 					controller.enqueue(frame);
 				}
 			},
 
-			cancel() {
-				self.removeConsumer(id);
+			cancel: () => {
+				this.removeConsumer(id);
 			},
 		});
 
@@ -388,15 +386,13 @@ export class BroadcastBuffer {
 	 * Returns the number of consumers removed. Idempotent.
 	 */
 	removeByClientId(clientId: string): number {
-		let removed = 0;
-		// Snapshot values: removeConsumer mutates the map.
-		for (const consumer of [...this.consumers.values()]) {
-			if (consumer.clientId === clientId) {
-				this.removeConsumer(consumer.id);
-				removed++;
-			}
-		}
-		return removed;
+		// Collect first: removeConsumer deletes from the map, and its onEmpty
+		// callback can re-enter and mutate it again.
+		const matching = Array.from(this.consumers.values()).filter(
+			(consumer) => consumer.clientId === clientId,
+		);
+		for (const consumer of matching) this.removeConsumer(consumer.id);
+		return matching.length;
 	}
 
 	/**

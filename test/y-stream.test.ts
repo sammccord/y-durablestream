@@ -5,7 +5,6 @@ import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
 import { YStreamProvider } from "../src/provider";
 
 import type { TestProvider } from "./worker";
-import type { TestSubscriber } from "./worker";
 
 // ──────────────────────────────────────────────────────────
 // Helpers
