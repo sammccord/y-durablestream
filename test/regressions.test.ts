@@ -1,10 +1,11 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { Doc, encodeStateAsUpdate } from "yjs";
+import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
 
 import { YStreamClient } from "../src/client";
 
 import type { YStreamProviderStub } from "../src/types";
+import type { TestProvider } from "./worker";
 
 // ──────────────────────────────────────────────────────────
 // Regression coverage for the 0.9.0 performance/billing fixes:
@@ -15,9 +16,47 @@ import type { YStreamProviderStub } from "../src/types";
 //    resolves connect() promptly instead of after up to maxDelay.
 // 3. notifyDebounceMs — a burst of updates is delivered to a registered
 //    push-subscriber as one merged push, not one per update.
+//
+// And for the 0.9.1 stream fixes:
+//
+// 4. A subscriber keeps receiving updates after its own write's echo is
+//    suppressed.
+// 5. syncOnce() tears down only its own subscription, not a live connect()
+//    stream sharing the clientId.
+// 6. disconnect() while subscribe() is in flight still removes the
+//    provider-side consumer.
+// 7. disconnect() ends a live connect() promptly instead of waiting for the
+//    provider's next frame.
 // ──────────────────────────────────────────────────────────
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 3_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (await check()) return;
+		await delay(25);
+	}
+}
+
+function consumerCount(provider: DurableObjectStub<TestProvider>): Promise<number> {
+	return runInDurableObject(provider, (instance) => instance["broadcast"].consumerCount);
+}
+
+function stubFor(
+	provider: DurableObjectStub<TestProvider>,
+	overrides: Partial<YStreamProviderStub> = {},
+): YStreamProviderStub {
+	return {
+		subscribe: (...args) => provider.subscribe(...args),
+		update: (...args) => provider.update(...args),
+		getYDoc: () => provider.getYDoc(),
+		register: (...args) => provider.register(...args),
+		deregister: (...args) => provider.deregister(...args),
+		unsubscribe: (...args) => provider.unsubscribe(...args),
+		...overrides,
+	};
+}
 
 /** A Yjs state update inserting text at position 0 in a named Y.Text field. */
 function createTextUpdate(field: string, content: string): Uint8Array {
@@ -129,5 +168,84 @@ describe("notify-push coalescing (notifyDebounceMs)", () => {
 		// ...in far fewer pushes than updates (1 expected; allow 2 in case
 		// the burst straddles a window boundary).
 		expect(await receiver.getPushCount()).toBeLessThanOrEqual(2);
+	});
+});
+
+describe("echo suppression does not stall the originator's stream", () => {
+	it("delivers later updates to a subscriber after its own write", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("echo-stall"));
+		const sub = env.Y_STREAM_SUBSCRIBER.get(env.Y_STREAM_SUBSCRIBER.idFromName("echo-stall-sub"));
+		await sub.connectToProvider("echo-stall");
+		await waitFor(() => sub.getSynced());
+
+		await sub.insertText("mine", 0, "a");
+		await waitFor(async () => {
+			const doc = new Doc();
+			applyUpdate(doc, await provider.getYDoc());
+			return doc.getText("mine").toString() === "a";
+		});
+
+		await provider.applyUpdate(createTextUpdate("theirs", "p"));
+		await waitFor(async () => (await sub.getText("theirs")) === "p");
+		expect(await sub.getText("theirs")).toBe("p");
+		await sub.disconnect();
+	});
+});
+
+describe("disconnect() during a live stream", () => {
+	it("resolves connect() without waiting for another frame", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("live-disconnect"));
+		const client = new YStreamClient(new Doc(), { stub: stubFor(provider) });
+		const connected = client.connect();
+		await waitFor(() => client.synced);
+
+		client.disconnect();
+		const outcome = await Promise.race([connected.then(() => "resolved"), delay(1_000).then(() => "hung")]);
+
+		expect(outcome).toBe("resolved");
+		expect(client.status).toBe("disconnected");
+		await waitFor(async () => (await consumerCount(provider)) === 0);
+	});
+});
+
+describe("per-subscription teardown", () => {
+	it("syncOnce() leaves a live connect() stream with the same clientId intact", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("sub-scope"));
+		const doc = new Doc();
+		const client = new YStreamClient(doc, {
+			stub: stubFor(provider),
+			clientId: "shared",
+		});
+		const connected = client.connect();
+		await waitFor(() => client.synced);
+
+		await client.syncOnce();
+		await provider.applyUpdate(createTextUpdate("after", "x"));
+		await waitFor(() => doc.getText("after").toString() === "x");
+
+		expect(doc.getText("after").toString()).toBe("x");
+		expect(client.status).toBe("synced");
+		client.disconnect();
+		await connected;
+		await waitFor(async () => (await consumerCount(provider)) === 0);
+	});
+
+	it("disconnect() during subscribe() removes the provider-side consumer", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("sub-race"));
+		let client: YStreamClient;
+		const stub = stubFor(provider, {
+			subscribe: async (...args) => {
+				const stream = await provider.subscribe(...args);
+				client.disconnect();
+				return stream;
+			},
+		});
+		client = new YStreamClient(new Doc(), { stub });
+
+		await client.connect();
+		await waitFor(async () => (await consumerCount(provider)) === 0);
+
+		expect(client.status).toBe("disconnected");
+		expect(await consumerCount(provider)).toBe(0);
 	});
 });

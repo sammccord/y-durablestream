@@ -22,11 +22,11 @@ import type {
 const MESSAGE_SYNC = 0;
 
 /**
- * Generate a globally unique client id.  The workerd runtime provides a
+ * Generate a globally unique id.  The workerd runtime provides a
  * standard global `crypto`; it is accessed via `globalThis` so the module
  * does not depend on a particular ambient `crypto` type declaration.
  */
-function generateClientId(): string {
+function randomId(): string {
 	return (
 		globalThis as unknown as { crypto: { randomUUID(): string } }
 	).crypto.randomUUID();
@@ -97,7 +97,11 @@ export class YStreamClient {
 	 */
 	private readonly clientId: string;
 
-	private stream: ReadableStream<Uint8Array> | null = null;
+	/**
+	 * Reader for the live stream, held so {@link disconnect} can cancel it.
+	 * Cancelling the stream itself fails while the read loop holds its lock.
+	 */
+	private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	private decoder: ReturnType<typeof createMessageDecoder> | null = null;
 
 	private _status: YStreamClientStatus = "disconnected";
@@ -156,7 +160,7 @@ export class YStreamClient {
 	constructor(doc: Doc, options: YStreamClientOptions) {
 		this.doc = doc;
 		this.stub = options.stub;
-		this.clientId = options.clientId ?? generateClientId();
+		this.clientId = options.clientId ?? randomId();
 		this.maxFrameSize = options.maxFrameSize;
 		this.interest = options.interest;
 		this.onError =
@@ -313,23 +317,26 @@ export class YStreamClient {
 	private async connectOnce(): Promise<void> {
 		this.setStatus("connecting");
 
+		const subscriptionId = randomId();
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe(this.clientId, this.interest);
+			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
 		} catch {
 			this.setStatus("disconnected");
 			return;
 		}
 
 		// If disconnect() was called while we were awaiting subscribe(),
-		// abort immediately without entering the read loop.
+		// skip the read loop but still release the provider-side consumer
+		// that subscribe() just created.
 		if (this._disposed) {
+			stream.cancel().catch(() => {});
+			await this.safeUnsubscribe(subscriptionId);
 			this.teardown();
 			return;
 		}
 
 		this.setStatus("connected");
-		this.stream = stream;
 
 		// Register local doc update handler to push changes upstream.
 		this.updateHandler = (update: Uint8Array, origin: unknown) => {
@@ -363,7 +370,7 @@ export class YStreamClient {
 		// boundary never reaches the provider's cancel callback, so without
 		// this the consumer stays registered until the provider DO is
 		// evicted. Awaited so a reconnect's fresh subscribe() cannot race it.
-		await this.safeUnsubscribe();
+		await this.safeUnsubscribe(subscriptionId);
 
 		// Clean up resources after the read loop exits.
 		// This is the ONLY place teardown is called during an active
@@ -397,13 +404,9 @@ export class YStreamClient {
 		// happened during setup (before readLoop starts).
 		this._disposed = true;
 
-		// Cancel the stream to unblock the for-await-of read loop.
-		// The cancellation causes the async iterator to throw inside
-		// the try block, which the catch handler swallows cleanly.
-		// connect() then calls teardown().
-		if (this.stream) {
-			this.stream.cancel().catch(() => {});
-		}
+		// Cancel through the read loop's reader: its pending read resolves
+		// as done, the loop exits, and connect() then calls teardown().
+		this.reader?.cancel().catch(() => {});
 
 		// Wake a pending reconnect backoff sleep so the connect() loop can
 		// observe _disposed and resolve now rather than after the delay.
@@ -415,29 +418,23 @@ export class YStreamClient {
 	// ═════════════════════════════════════
 
 	/**
-	 * Consume the stream using `for await...of`, decode frames, and
-	 * process each complete Yjs sync protocol message.
-	 *
-	 * This replaces the previous `reader.read().then()` loop with
-	 * direct async iteration over the `ReadableStream`, eliminating
-	 * the reader lock ceremony (`getReader` / `releaseLock`) and the
-	 * manual `.then(_, onRejected)` workaround.
-	 *
-	 * The `try/catch` around `for await` uniformly handles both
-	 * stream errors and cancellation (from {@link disconnect}).
+	 * Read the stream, decode frames, and process each complete Yjs sync
+	 * protocol message until the stream ends or {@link disconnect} cancels
+	 * the reader.
 	 *
 	 * Always resolves — never rejects.
 	 */
 	private async readLoop(stream: ReadableStream<Uint8Array>): Promise<void> {
 		const decoder = createMessageDecoder({ maxFrameSize: this.maxFrameSize });
 		this.decoder = decoder;
+		const reader = stream.getReader();
+		this.reader = reader;
 
 		try {
-			for await (const chunk of stream) {
-				if (this._disposed) break;
-
-				const messages = decoder.push(chunk);
-				for (const msg of messages) {
+			while (!this._disposed) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				for (const msg of decoder.push(value)) {
 					this.handleMessage(msg);
 				}
 			}
@@ -513,9 +510,10 @@ export class YStreamClient {
 	 * connection). Always resolves; never rejects.
 	 */
 	async syncOnce(): Promise<void> {
+		const subscriptionId = randomId();
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe(this.clientId, this.interest);
+			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
 		} catch {
 			return;
 		}
@@ -541,19 +539,21 @@ export class YStreamClient {
 			// Breaking out of `for await` cancels the stream iterator locally,
 			// but the cancel does not reach the provider across the RPC
 			// boundary — tell it explicitly so our consumer is removed.
-			await this.safeUnsubscribe();
+			await this.safeUnsubscribe(subscriptionId);
 			decoder.reset();
 		}
 	}
 
 	/**
-	 * Ask the provider to drop this client's stream consumers. Tolerates
-	 * pre-0.9 providers (no `unsubscribe` RPC) and unreachable providers —
-	 * in both cases there is nothing further to clean up from here.
+	 * Ask the provider to drop the stream consumer for one subscription.
+	 * Tolerates pre-0.9 providers (no `unsubscribe` RPC) and unreachable
+	 * providers — in both cases there is nothing further to clean up from
+	 * here. A 0.9.0 provider ignores `subscriptionId` and drops every
+	 * stream for this `clientId`.
 	 */
-	private async safeUnsubscribe(): Promise<void> {
+	private async safeUnsubscribe(subscriptionId: string): Promise<void> {
 		try {
-			await this.stub.unsubscribe?.(this.clientId);
+			await this.stub.unsubscribe?.(this.clientId, subscriptionId);
 		} catch {
 			// Provider unreachable/evicted — its consumer state is gone anyway.
 		}
@@ -628,7 +628,7 @@ export class YStreamClient {
 			this.updateHandler = null;
 		}
 
-		this.stream = null;
+		this.reader = null;
 
 		if (this.decoder) {
 			this.decoder.reset();

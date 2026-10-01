@@ -40,6 +40,12 @@ interface ConsumerState {
 	 */
 	clientId: string | undefined;
 	/**
+	 * Caller-supplied id for this one subscription, so a client holding
+	 * several streams under the same `clientId` can tear down just one
+	 * (see {@link BroadcastBuffer.removeByClientId}).
+	 */
+	subscriptionId: string | undefined;
+	/**
 	 * Interest set of routing keys. `null` means "interested in everything"
 	 * (the full-sync default). Otherwise the consumer receives only keyless
 	 * (control) frames and keyed frames whose key is in this set.
@@ -241,17 +247,21 @@ export class BroadcastBuffer {
 	 * @param interest - Optional set of routing keys this consumer wants. When
 	 *   provided, the consumer receives only keyless (control) frames and keyed
 	 *   frames whose key is in the set. Omit (or pass `null`) for full sync.
+	 * @param subscriptionId - Optional id scoping {@link removeByClientId} to
+	 *   this consumer alone.
 	 */
 	createConsumer(
 		initialFrames?: Uint8Array[],
 		clientId?: string,
 		interest?: Iterable<string> | null,
+		subscriptionId?: string,
 	): BroadcastConsumer {
 		const id = this.nextId++;
 
 		const state: ConsumerState = {
 			id,
 			clientId,
+			subscriptionId,
 			interest: interest == null ? null : new Set(interest),
 			// New consumers start at the current buffer head so they
 			// don't receive historical frames (they get initial sync
@@ -378,18 +388,21 @@ export class BroadcastBuffer {
 	}
 
 	/**
-	 * Remove every consumer created with the given `clientId`.
+	 * Remove every consumer created with the given `clientId`, or only the
+	 * one created with `subscriptionId` when that is given.
 	 *
 	 * This is the deterministic cleanup path for subscriber streams whose
 	 * teardown does not reach the ReadableStream cancel callback (workerd
 	 * drops RPC-boundary streams as a connection loss without cancelling).
 	 * Returns the number of consumers removed. Idempotent.
 	 */
-	removeByClientId(clientId: string): number {
+	removeByClientId(clientId: string, subscriptionId?: string): number {
 		// Collect first: removeConsumer deletes from the map, and its onEmpty
 		// callback can re-enter and mutate it again.
 		const matching = Array.from(this.consumers.values()).filter(
-			(consumer) => consumer.clientId === clientId,
+			(consumer) =>
+				consumer.clientId === clientId &&
+				(subscriptionId === undefined || consumer.subscriptionId === subscriptionId),
 		);
 		for (const consumer of matching) this.removeConsumer(consumer.id);
 		return matching.length;
