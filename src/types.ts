@@ -152,6 +152,14 @@ export interface YStreamClientOptions {
 	 * sync. Outgoing local updates are keyed by their transaction origin's
 	 * `key` (set `doc.transact(fn, { key })` so the change routes to the right
 	 * interest); updates with no key broadcast to all.
+	 *
+	 * **Constraint:** each writer's Yjs client (`doc.clientID`) must change
+	 * only one routing key. Yjs numbers a client's updates in one sequence,
+	 * so a subscriber that receives that client's update for key `b` but not
+	 * its earlier update for key `a` can never apply the `b` update. Give each
+	 * key its own `Y.Doc`, or route keys from separate clients. When this
+	 * happens the client reports a `PendingUpdateError` through
+	 * `onError`.
 	 */
 	interest?: string[];
 

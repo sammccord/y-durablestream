@@ -52,7 +52,7 @@
  */
 
 export { YStreamProvider } from "./provider";
-export { YStreamClient } from "./client";
+export { PendingUpdateError, YStreamClient } from "./client";
 export {
 	encodeFrame,
 	encodeFrames,
