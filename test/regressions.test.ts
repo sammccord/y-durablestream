@@ -301,3 +301,65 @@ describe("client error reporting", () => {
 		await waitFor(async () => (await consumerCount(provider)) === 0);
 	});
 });
+
+describe("client lifecycle", () => {
+	function failingClient(name: string, reconnect: { maxRetries: number } | false) {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName(name));
+		const calls = { subscribes: 0 };
+		const client = new YStreamClient(new Doc(), {
+			stub: stubFor(provider, {
+				subscribe: async () => {
+					calls.subscribes++;
+					throw new Error("provider unavailable");
+				},
+			}),
+			reconnect: reconnect && { ...reconnect, initialDelay: 20 },
+			onError: () => {},
+		});
+		return { client, calls };
+	}
+
+	it("emits 'disconnected' once, after the reconnect loop has ended", async () => {
+		const { client, calls } = failingClient("disconnected-once", { maxRetries: 2 });
+		const seenAt: number[] = [];
+		client.onStatusChange((status) => {
+			if (status === "disconnected") seenAt.push(calls.subscribes);
+		});
+
+		await client.connect();
+		await delay(100);
+
+		expect(calls.subscribes).toBe(3);
+		expect(seenAt).toEqual([3]);
+	});
+
+	it("connect() from a 'disconnected' listener starts a fresh loop after the first ends", async () => {
+		const { client, calls } = failingClient("listener-reconnect", { maxRetries: 1 });
+		const seenAt: number[] = [];
+		let second: Promise<void> | undefined;
+		client.onStatusChange((status) => {
+			if (status !== "disconnected") return;
+			seenAt.push(calls.subscribes);
+			second ??= client.connect();
+		});
+
+		await client.connect();
+		await second;
+
+		expect(seenAt).toEqual([2, 4]);
+		expect(client.status).toBe("disconnected");
+	});
+
+	it("connect() from a 'disconnected' listener reconnects when auto-reconnect is off", async () => {
+		const { client, calls } = failingClient("manual-reconnect", false);
+		let second: Promise<void> | undefined;
+		client.onStatusChange((status) => {
+			if (status === "disconnected") second ??= client.connect();
+		});
+
+		await client.connect();
+		await second;
+
+		expect(calls.subscribes).toBe(2);
+	});
+});
