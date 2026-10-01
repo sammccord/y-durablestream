@@ -92,66 +92,72 @@ export function encodeFrames(messages: Uint8Array[]): Uint8Array {
  */
 export function createFrameDecoder(options?: FrameDecoderOptions): FrameDecoder {
 	const maxFrameSize = options?.maxFrameSize ?? DEFAULT_MAX_FRAME_SIZE;
-	let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
-	// Read position into `buffer`.  Consumed frames advance `offset`
-	// instead of reallocating the buffer, so decoding N frames from one
-	// chunk is O(N) rather than O(N²).
+	// Unconsumed input, oldest first. Chunks are queued rather than
+	// concatenated so a frame split across many chunks is copied once, when
+	// it completes, instead of once per arriving chunk.
+	let chunks: Uint8Array[] = [];
+	// Read position into `chunks[0]`.
 	let offset = 0;
+	let buffered = 0;
+
+	function byteAt(index: number): number {
+		let i = offset + index;
+		for (const chunk of chunks) {
+			if (i < chunk.byteLength) return chunk[i];
+			i -= chunk.byteLength;
+		}
+		throw new RangeError("Read past buffered input");
+	}
+
+	/** Consume `n` buffered bytes, copying them into `into` when given. */
+	function consume(n: number, into?: Uint8Array): void {
+		let done = 0;
+		while (done < n) {
+			const chunk = chunks[0];
+			const count = Math.min(n - done, chunk.byteLength - offset);
+			into?.set(chunk.subarray(offset, offset + count), done);
+			done += count;
+			offset += count;
+			if (offset === chunk.byteLength) {
+				chunks.shift();
+				offset = 0;
+			}
+		}
+		buffered -= n;
+	}
 
 	function push(chunk: Uint8Array): Uint8Array[] {
-		if (offset >= buffer.byteLength) {
-			// Everything buffered so far has been consumed — adopt the
-			// new chunk directly (zero-copy fast path for whole frames).
-			buffer = chunk;
-			offset = 0;
-		} else {
-			// Compact the unconsumed tail and append the new chunk.
-			const remaining = buffer.byteLength - offset;
-			const combined = new Uint8Array(remaining + chunk.byteLength);
-			combined.set(buffer.subarray(offset), 0);
-			combined.set(chunk, remaining);
-			buffer = combined;
-			offset = 0;
-		}
+		chunks.push(chunk);
+		buffered += chunk.byteLength;
 
 		const messages: Uint8Array[] = [];
-
-		// Extract as many complete frames as possible
-		while (buffer.byteLength - offset >= HEADER_SIZE) {
-			const view = new DataView(
-				buffer.buffer,
-				buffer.byteOffset + offset,
-				buffer.byteLength - offset,
-			);
-			const payloadLength = view.getUint32(0, false);
+		while (buffered >= HEADER_SIZE) {
+			const payloadLength =
+				(byteAt(0) * 0x1000000 + (byteAt(1) << 16) + (byteAt(2) << 8) + byteAt(3));
 
 			if (payloadLength > maxFrameSize) {
 				throw new FrameDecodeError(
 					`Frame payload length ${payloadLength} exceeds maximum of ${maxFrameSize} bytes`
 				);
 			}
+			if (buffered < HEADER_SIZE + payloadLength) break;
 
-			const frameSize = HEADER_SIZE + payloadLength;
-			if (buffer.byteLength - offset < frameSize) {
-				// Not enough data yet for the full frame — wait for more
-				break;
-			}
-
-			// Extract the complete message payload and advance past the frame.
-			messages.push(buffer.slice(offset + HEADER_SIZE, offset + frameSize));
-			offset += frameSize;
+			const message = new Uint8Array(payloadLength);
+			consume(HEADER_SIZE);
+			consume(payloadLength, message);
+			messages.push(message);
 		}
-
 		return messages;
 	}
 
 	function reset(): void {
-		buffer = new Uint8Array(0);
+		chunks = [];
 		offset = 0;
+		buffered = 0;
 	}
 
 	function bufferedBytes(): number {
-		return buffer.byteLength - offset;
+		return buffered;
 	}
 
 	return { push, reset, bufferedBytes };
