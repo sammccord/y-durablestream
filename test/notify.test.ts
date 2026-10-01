@@ -1,8 +1,12 @@
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { createEncoder, toUint8Array, writeVarUint } from "lib0/encoding";
 import { writeUpdate } from "y-protocols/sync";
 import { describe, expect, it } from "vitest";
 import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
+
+import { YStreamProvider } from "../src/provider";
+
+import { harness } from "./harness";
 
 // ──────────────────────────────────────────────────────────
 // Notify-push: registry + pushToSubscriber + syncOnce
@@ -115,5 +119,43 @@ describe("YStreamClient.syncOnce", () => {
 		expect(doc.getText("beta").toString()).toBe("S");
 		// syncOnce does not open a persistent connection
 		expect(await r.getStatus()).toBe("disconnected");
+	});
+});
+
+class FailingPushProvider extends YStreamProvider {
+	pushErrors: { error: unknown; address: unknown }[] = [];
+	storageErrors: unknown[] = [];
+
+	protected override async pushToSubscriber(): Promise<void> {
+		throw new Error("subscriber gone");
+	}
+
+	protected override onPushError(error: unknown, address: unknown): void {
+		this.pushErrors.push({ error, address });
+	}
+
+	protected override onStorageError(error: unknown): void {
+		this.storageErrors.push(error);
+	}
+}
+
+describe("notify-push delivery failures", () => {
+	it("routes a rejected pushToSubscriber to onPushError with the address", async () => {
+		const stub = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("push-failure"));
+		await runInDurableObject(stub, async (_instance, state) => {
+			const { provider, settled } = harness(FailingPushProvider, state);
+			await settled();
+			await provider.register("dead-sub", { name: "dead-sub" });
+
+			const doc = new Doc();
+			doc.getText("t").insert(0, "x");
+			await provider.applyUpdate(encodeStateAsUpdate(doc));
+			await settled();
+
+			expect(provider.pushErrors).toHaveLength(1);
+			expect(provider.pushErrors[0].address).toEqual({ name: "dead-sub" });
+			expect(String(provider.pushErrors[0].error)).toContain("subscriber gone");
+			expect(provider.storageErrors).toEqual([]);
+		});
 	});
 });

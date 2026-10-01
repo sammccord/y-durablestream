@@ -614,11 +614,8 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	private deliverToSubscribers(update: Uint8Array, originId?: string, key?: string): void {
 		for (const [clientId, address] of this.subscribers) {
 			if (clientId === originId) continue; // do not echo a subscriber's own write
-			try {
-				this.pushToSubscriber(address, update, key);
-			} catch (err) {
-				this.onStorageError(err);
-			}
+			const delivered = (async () => this.pushToSubscriber(address, update, key))();
+			this.ctx.waitUntil(delivered.catch((err) => this.onPushError(err, address)));
 		}
 	}
 
@@ -626,15 +623,20 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * Deliver one update to a registered subscriber. The **base implementation is
 	 * a no-op** — the library cannot know how to reach an arbitrary subscriber
 	 * Durable Object generically. Override in a subclass to RPC the subscriber
-	 * (e.g. `this.env[address.binding].get(idFromName(address.name)).onUpdate(...)`),
-	 * typically wrapped in `this.ctx.waitUntil(...)`. Errors are routed to
-	 * {@link onStorageError}.
+	 * and return the call's promise
+	 * (e.g. `return this.env[address.binding].get(idFromName(address.name)).onUpdate(...)`).
+	 * The provider ties it to the Durable Object's lifetime with `waitUntil`
+	 * and routes a throw or rejection to {@link onPushError}.
 	 *
 	 * @param address The opaque value passed to {@link register}.
 	 * @param update The raw Yjs document update to deliver (apply via `Y.applyUpdate`).
 	 * @param key The interest routing key for this update, if any.
 	 */
-	protected pushToSubscriber(address: unknown, update: Uint8Array, key?: string): void {
+	protected pushToSubscriber(
+		address: unknown,
+		update: Uint8Array,
+		key?: string,
+	): void | Promise<void> {
 		void address;
 		void update;
 		void key;
@@ -651,6 +653,19 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 */
 	protected onStorageError(error: unknown): void {
 		console.error("[y-durablestream] storage operation failed:", error);
+	}
+
+	/**
+	 * Hook invoked when {@link pushToSubscriber} throws or rejects.
+	 *
+	 * The default implementation logs the error. Override it to report the
+	 * failure, or to {@link deregister} a subscriber that no longer exists.
+	 *
+	 * @param error - The error from the delivery.
+	 * @param address - The failed subscriber's address, as given to {@link register}.
+	 */
+	protected onPushError(error: unknown, address: unknown): void {
+		console.error("[y-durablestream] push to subscriber failed:", error, address);
 	}
 
 	/**
