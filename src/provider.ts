@@ -26,13 +26,6 @@ import type { YStreamProviderOptions } from "./types";
 const MESSAGE_SYNC = 0;
 
 /**
- * Byte length of an empty document encoded via `encodeStateAsUpdate`.
- * A freshly created `Y.Doc` with no content encodes to exactly two
- * bytes, so anything larger carries real persisted state worth applying.
- */
-const EMPTY_DOC_UPDATE_BYTES = 2;
-
-/**
  * Legacy (pre-0.9) DO storage key that held the entire push-subscriber
  * registry as one value. Migrated to per-subscriber keys on first load.
  */
@@ -313,13 +306,8 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * Subclasses may override this but **must** call `super.onStart()`.
 	 */
 	protected async onStart(): Promise<void> {
-		const persisted = await this.storage.getYDoc();
-		const state = encodeStateAsUpdate(persisted);
-		if (state.byteLength > EMPTY_DOC_UPDATE_BYTES) {
-			// Only apply if there is meaningful content (an empty doc
-			// encodes to a 2-byte update).
-			applyUpdate(this.doc, state);
-		}
+		const persisted = await this.storage.load();
+		if (persisted) applyUpdate(this.doc, persisted);
 
 		// Restore the push-subscriber registry persisted across evictions
 		// (one key per subscriber; see SUB_KEY_PREFIX).
@@ -555,7 +543,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		this.notifySubscribers(update, originId, key);
 		this.dirtySinceCommit = true;
 		this.ctx.waitUntil(
-			this.storage.storeUpdate(update).catch((err) => {
+			this.storage.storeUpdate(update, this.doc).catch((err) => {
 				this.onStorageError(err);
 			}),
 		);
