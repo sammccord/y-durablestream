@@ -97,7 +97,11 @@ export class YStreamClient {
 	 */
 	private readonly clientId: string;
 
-	private stream: ReadableStream<Uint8Array> | null = null;
+	/**
+	 * Reader for the live stream, held so {@link disconnect} can cancel it.
+	 * Cancelling the stream itself fails while the read loop holds its lock.
+	 */
+	private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	private decoder: ReturnType<typeof createMessageDecoder> | null = null;
 
 	private _status: YStreamClientStatus = "disconnected";
@@ -329,7 +333,6 @@ export class YStreamClient {
 		}
 
 		this.setStatus("connected");
-		this.stream = stream;
 
 		// Register local doc update handler to push changes upstream.
 		this.updateHandler = (update: Uint8Array, origin: unknown) => {
@@ -397,13 +400,9 @@ export class YStreamClient {
 		// happened during setup (before readLoop starts).
 		this._disposed = true;
 
-		// Cancel the stream to unblock the for-await-of read loop.
-		// The cancellation causes the async iterator to throw inside
-		// the try block, which the catch handler swallows cleanly.
-		// connect() then calls teardown().
-		if (this.stream) {
-			this.stream.cancel().catch(() => {});
-		}
+		// Cancel through the read loop's reader: its pending read resolves
+		// as done, the loop exits, and connect() then calls teardown().
+		this.reader?.cancel().catch(() => {});
 
 		// Wake a pending reconnect backoff sleep so the connect() loop can
 		// observe _disposed and resolve now rather than after the delay.
@@ -415,29 +414,23 @@ export class YStreamClient {
 	// ═════════════════════════════════════
 
 	/**
-	 * Consume the stream using `for await...of`, decode frames, and
-	 * process each complete Yjs sync protocol message.
-	 *
-	 * This replaces the previous `reader.read().then()` loop with
-	 * direct async iteration over the `ReadableStream`, eliminating
-	 * the reader lock ceremony (`getReader` / `releaseLock`) and the
-	 * manual `.then(_, onRejected)` workaround.
-	 *
-	 * The `try/catch` around `for await` uniformly handles both
-	 * stream errors and cancellation (from {@link disconnect}).
+	 * Read the stream, decode frames, and process each complete Yjs sync
+	 * protocol message until the stream ends or {@link disconnect} cancels
+	 * the reader.
 	 *
 	 * Always resolves — never rejects.
 	 */
 	private async readLoop(stream: ReadableStream<Uint8Array>): Promise<void> {
 		const decoder = createMessageDecoder({ maxFrameSize: this.maxFrameSize });
 		this.decoder = decoder;
+		const reader = stream.getReader();
+		this.reader = reader;
 
 		try {
-			for await (const chunk of stream) {
-				if (this._disposed) break;
-
-				const messages = decoder.push(chunk);
-				for (const msg of messages) {
+			while (!this._disposed) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				for (const msg of decoder.push(value)) {
 					this.handleMessage(msg);
 				}
 			}
@@ -628,7 +621,7 @@ export class YStreamClient {
 			this.updateHandler = null;
 		}
 
-		this.stream = null;
+		this.reader = null;
 
 		if (this.decoder) {
 			this.decoder.reset();
