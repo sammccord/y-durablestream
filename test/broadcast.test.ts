@@ -410,4 +410,14 @@ describe("BroadcastBuffer removeByClientId", () => {
 		expect(buf.removeByClientId("a")).toBe(2);
 		expect(buf.consumerCount).toBe(1);
 	});
+
+	it("removes only the named subscription when given a subscriptionId", () => {
+		const buf = new BroadcastBuffer();
+		buf.createConsumer(undefined, "a", undefined, "live");
+		buf.createConsumer(undefined, "a", undefined, "one-shot");
+
+		expect(buf.removeByClientId("a", "one-shot")).toBe(1);
+		expect(buf.removeByClientId("a", "one-shot")).toBe(0);
+		expect(buf.consumerCount).toBe(1);
+	});
 });
