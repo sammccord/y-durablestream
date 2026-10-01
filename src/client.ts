@@ -122,7 +122,6 @@ export class YStreamClient {
 	 * Cancelling the stream itself fails while the read loop holds its lock.
 	 */
 	private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
-	private decoder: ReturnType<typeof createMessageDecoder> | null = null;
 
 	private _status: YStreamClientStatus = "disconnected";
 	private _synced = false;
@@ -464,7 +463,6 @@ export class YStreamClient {
 	 */
 	private async readLoop(stream: ReadableStream<Uint8Array>): Promise<void> {
 		const decoder = createMessageDecoder({ maxFrameSize: this.maxFrameSize });
-		this.decoder = decoder;
 		const reader = stream.getReader();
 		this.reader = reader;
 
@@ -594,7 +592,6 @@ export class YStreamClient {
 			// but the cancel does not reach the provider across the RPC
 			// boundary — tell it explicitly so our consumer is removed.
 			await this.safeUnsubscribe(subscriptionId);
-			decoder.reset();
 		}
 		return done;
 	}
@@ -684,11 +681,6 @@ export class YStreamClient {
 		}
 
 		this.reader = null;
-
-		if (this.decoder) {
-			this.decoder.reset();
-			this.decoder = null;
-		}
 
 		this._synced = false;
 	}
