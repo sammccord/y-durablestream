@@ -6,7 +6,8 @@ import { YStreamProvider } from "../src/provider";
 import { DurableObjectSqlStorage } from "../src/storage/sql";
 
 import type { YDocStorage } from "../src/storage/types";
-import type { YStreamProviderOptions } from "../src/types";
+
+import { harness } from "./harness";
 
 class SqlProvider extends YStreamProvider {
 	protected override createStorage(): YDocStorage {
@@ -18,36 +19,6 @@ const backends = [
 	["KV", YStreamProvider],
 	["SQL", SqlProvider],
 ] as const;
-
-/**
- * A provider over `state`'s storage whose startup and background writes the
- * test can await. Inside `runInDurableObject` the real `blockConcurrencyWhile`
- * defers until the callback returns, so the constructor's load would never
- * run; shadowing it on the state lets the test drive startup directly.
- */
-function harness(
-	Provider: (typeof backends)[number][1],
-	state: DurableObjectState,
-	options: YStreamProviderOptions,
-) {
-	const pending: Promise<unknown>[] = [];
-	Object.defineProperties(state, {
-		waitUntil: { configurable: true, value: (promise: Promise<unknown>) => void pending.push(promise) },
-		blockConcurrencyWhile: {
-			configurable: true,
-			value: <T,>(callback: () => Promise<T>) => {
-				const started = callback();
-				pending.push(started);
-				return started;
-			},
-		},
-	});
-	const provider = new Provider(state, env, options);
-	const settled = async () => {
-		while (pending.length > 0) await pending.shift();
-	};
-	return { provider, settled };
-}
 
 describe.each(backends)("%s storage with gc: false", (name, Provider) => {
 	it("keeps deleted content through compaction and reload", async () => {
