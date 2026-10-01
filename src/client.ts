@@ -33,6 +33,26 @@ function randomId(): string {
 }
 
 /**
+ * Reported through `onError` when an update from the provider cannot be
+ * applied because updates it depends on never arrived. Yjs keeps such an
+ * update pending indefinitely, so the local document has diverged.
+ *
+ * With `interest` set this means a writer's Yjs client changed more than one
+ * routing key: see {@link YStreamClientOptions.interest}. Reconnecting does
+ * not repair it; the subscriber needs updates for the missing keys.
+ */
+export class PendingUpdateError extends Error {
+	constructor() {
+		super(
+			"An update from the provider depends on updates this client never received, " +
+				"so Yjs cannot apply it. With `interest` set, each writer's Yjs client must " +
+				"change only one routing key.",
+		);
+		this.name = "PendingUpdateError";
+	}
+}
+
+/**
  * y-protocols/sync messageYjsSyncStep2 constant.
  * After receiving and processing a SyncStep2, the client considers
  * itself fully synchronised with the provider.
@@ -160,6 +180,9 @@ export class YStreamClient {
 	 * `maxDelay` waiting out a backoff that no longer matters.
 	 */
 	private wakeReconnect: (() => void) | null = null;
+
+	/** Whether a {@link PendingUpdateError} has been reported for the current gap. */
+	private reportedPending = false;
 
 	/** Error hook for background send failures (see {@link YStreamClientOptions.onError}). */
 	private readonly onError: (error: unknown) => void;
@@ -509,7 +532,15 @@ export class YStreamClient {
 
 		writeVarUint(encoder, MESSAGE_SYNC);
 		const syncType = readSyncMessage(msgDecoder, encoder, this.doc, this);
+		this.checkPending();
 		return { syncType, reply: length(encoder) > 1 ? toUint8Array(encoder) : null };
+	}
+
+	/** Report once each time the doc starts holding an unapplicable update. */
+	private checkPending(): void {
+		const pending = this.doc.store.pendingStructs !== null;
+		if (pending && !this.reportedPending) this.onError(new PendingUpdateError());
+		this.reportedPending = pending;
 	}
 
 	/**

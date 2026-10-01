@@ -363,3 +363,31 @@ describe("client lifecycle", () => {
 		expect(calls.subscribes).toBe(2);
 	});
 });
+
+describe("interest divergence guard", () => {
+	it("reports through onError when a filtered stream leaves updates pending", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("interest-gap"));
+		const errors: unknown[] = [];
+		const readerDoc = new Doc();
+		const reader = new YStreamClient(readerDoc, {
+			stub: stubFor(provider),
+			interest: ["b"],
+			onError: (error) => errors.push(error),
+		});
+		const writerDoc = new Doc();
+		const writer = new YStreamClient(writerDoc, { stub: stubFor(provider) });
+		const readerLoop = reader.connect();
+		const writerLoop = writer.connect();
+		await waitFor(() => reader.synced && writer.synced);
+
+		writerDoc.transact(() => writerDoc.getMap("a").set("x", 1), { key: "a" });
+		writerDoc.transact(() => writerDoc.getMap("b").set("y", 2), { key: "b" });
+		await waitFor(() => errors.length > 0);
+
+		expect(errors).toEqual([expect.objectContaining({ name: "PendingUpdateError" })]);
+		reader.disconnect();
+		writer.disconnect();
+		await Promise.all([readerLoop, writerLoop]);
+		await waitFor(async () => (await consumerCount(provider)) === 0);
+	});
+});
