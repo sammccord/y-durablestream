@@ -265,15 +265,15 @@ Implement the `YDocStorage` interface to create your own backend:
 
 ```typescript
 import type { YDocStorage } from "y-durablestream";
-import { Doc } from "yjs";
+import type { Doc } from "yjs";
 
 class MyCustomStorage implements YDocStorage {
-  async getYDoc(): Promise<Doc> {
-    // Load and return a Doc with all persisted state
+  async load(): Promise<Uint8Array | null> {
+    // Return all persisted state as one update (Y.mergeUpdates), or null
   }
 
-  async storeUpdate(update: Uint8Array): Promise<void> {
-    // Persist an incremental update, auto-compact when thresholds exceeded
+  async storeUpdate(update: Uint8Array, doc: Doc): Promise<void> {
+    // Persist an incremental update; past the thresholds, snapshot `doc`
   }
 
   async commit(doc: Doc): Promise<void> {
@@ -316,7 +316,7 @@ import { encodeFrame, encodeFrames, createFrameDecoder, FrameDecodeError } from 
 
 ### Persistence
 
-Updates are stored incrementally. When the cumulative byte size or count exceeds configurable thresholds, all incremental updates are compacted into a single snapshot. Compaction also runs automatically when the last subscriber disconnects.
+Updates are stored incrementally. When their count exceeds `maxUpdates`, or their cumulative size exceeds the larger of `maxBytes` and the current snapshot size, they are compacted into a single snapshot of the live document. Compaction also runs automatically when the last subscriber disconnects.
 
 ### Why Length-Prefixed Framing?
 

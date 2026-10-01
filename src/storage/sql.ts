@@ -1,5 +1,6 @@
-import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
+import { encodeStateAsUpdate, mergeUpdates } from "yjs";
 
+import type { Doc } from "yjs";
 import type { YDocStorage, YDocStorageOptions } from "./types";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_UPDATES } from "./types";
 
@@ -74,6 +75,7 @@ interface AggregateRow {
 	[key: string]: SqlStorageValue;
 	total_count: number;
 	total_bytes: number;
+	snapshot_bytes: number;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -138,6 +140,7 @@ export class DurableObjectSqlStorage implements YDocStorage {
 	 */
 	private updateCount: number;
 	private updateBytes: number;
+	private snapshotBytes: number;
 
 	constructor(storage: SqlCapableStorage, options?: YDocStorageOptions) {
 		this.storage = storage;
@@ -154,59 +157,49 @@ export class DurableObjectSqlStorage implements YDocStorage {
 		const seeded = this.readAggregates();
 		this.updateCount = seeded.count;
 		this.updateBytes = seeded.bytes;
+		this.snapshotBytes = seeded.snapshotBytes;
 	}
 
-	/** Aggregate the updates table — used to seed/reseed the running counters. */
-	private readAggregates(): { count: number; bytes: number } {
-		const { total_count, total_bytes } = this.sql
+	/** Aggregate the tables — used to seed/reseed the running counters. */
+	private readAggregates(): { count: number; bytes: number; snapshotBytes: number } {
+		const { total_count, total_bytes, snapshot_bytes } = this.sql
 			.exec<AggregateRow>(
-				"SELECT COUNT(*) AS total_count, COALESCE(SUM(byte_length), 0) AS total_bytes FROM yjs_updates",
+				`SELECT COUNT(*) AS total_count, COALESCE(SUM(byte_length), 0) AS total_bytes,
+					(SELECT COALESCE(SUM(LENGTH(data)), 0) FROM yjs_snapshot) AS snapshot_bytes
+				FROM yjs_updates`,
 			)
 			.one();
-		return { count: total_count, bytes: total_bytes };
+		return { count: total_count, bytes: total_bytes, snapshotBytes: snapshot_bytes };
 	}
 
 	/**
-	 * Re-derive the counters from the table after a failed transaction — a
+	 * Re-derive the counters from the tables after a failed transaction — a
 	 * rollback restores the rows but not the in-memory increments.
 	 */
 	private reseedCounters(): void {
-		const { count, bytes } = this.readAggregates();
+		const { count, bytes, snapshotBytes } = this.readAggregates();
 		this.updateCount = count;
 		this.updateBytes = bytes;
+		this.snapshotBytes = snapshotBytes;
 	}
 
 	// ═════════════════════════════════════
 	// YDocStorage implementation
 	// ═════════════════════════════════════
 
-	async getYDoc(): Promise<Doc> {
-		const doc = new Doc();
-
-		doc.transact(() => {
-			// 1. Apply the compacted snapshot (if any)
-			const snapshots = this.sql
-				.exec<SnapshotRow>("SELECT data FROM yjs_snapshot WHERE id = 1")
-				.toArray();
-
-			if (snapshots.length > 0) {
-				applyUpdate(doc, new Uint8Array(snapshots[0].data));
-			}
-
-			// 2. Apply all incremental updates in insertion order
-			const updates = this.sql
-				.exec<UpdateRow>("SELECT data FROM yjs_updates ORDER BY id ASC")
-				.toArray();
-
-			for (const row of updates) {
-				applyUpdate(doc, new Uint8Array(row.data));
-			}
-		});
-
-		return doc;
+	async load(): Promise<Uint8Array | null> {
+		const snapshots = this.sql
+			.exec<SnapshotRow>("SELECT data FROM yjs_snapshot WHERE id = 1")
+			.toArray();
+		const updates = this.sql
+			.exec<UpdateRow>("SELECT data FROM yjs_updates ORDER BY id ASC")
+			.toArray();
+		const parts = [...snapshots, ...updates].map((row) => new Uint8Array(row.data));
+		if (parts.length === 0) return null;
+		return parts.length === 1 ? parts[0] : mergeUpdates(parts);
 	}
 
-	async storeUpdate(update: Uint8Array): Promise<void> {
+	async storeUpdate(update: Uint8Array, doc: Doc): Promise<void> {
 		try {
 			// Use a synchronous transaction so the INSERT + threshold
 			// check + possible compaction are all atomic.
@@ -222,8 +215,11 @@ export class DurableObjectSqlStorage implements YDocStorage {
 				this.updateCount += 1;
 				this.updateBytes += update.byteLength;
 
-				if (this.updateCount > this.maxUpdates || this.updateBytes > this.maxBytes) {
-					this.compactSync();
+				if (
+					this.updateCount > this.maxUpdates ||
+					this.updateBytes > Math.max(this.maxBytes, this.snapshotBytes)
+				) {
+					this.compact(doc);
 				}
 			});
 		} catch (error) {
@@ -234,10 +230,7 @@ export class DurableObjectSqlStorage implements YDocStorage {
 
 	async commit(doc: Doc): Promise<void> {
 		try {
-			this.storage.transactionSync(() => {
-				this.writeSnapshot(encodeStateAsUpdate(doc));
-				this.clearUpdates();
-			});
+			this.storage.transactionSync(() => this.compact(doc));
 		} catch (error) {
 			this.reseedCounters();
 			throw error;
@@ -249,59 +242,20 @@ export class DurableObjectSqlStorage implements YDocStorage {
 	// ═════════════════════════════════════
 
 	/**
-	 * Compact all incremental updates into the snapshot within the
-	 * current synchronous transaction.
-	 *
-	 * Rebuilds the document from the existing snapshot + all updates,
-	 * then replaces the snapshot and clears the updates table.
+	 * Replace the snapshot with `doc`'s state and clear the updates table,
+	 * within the caller's synchronous transaction.
 	 */
-	private compactSync(): void {
-		const doc = new Doc();
-
-		doc.transact(() => {
-			// Read existing snapshot
-			const snapshots = this.sql
-				.exec<SnapshotRow>("SELECT data FROM yjs_snapshot WHERE id = 1")
-				.toArray();
-
-			if (snapshots.length > 0) {
-				applyUpdate(doc, new Uint8Array(snapshots[0].data));
-			}
-
-			// Apply all incremental updates
-			const updates = this.sql
-				.exec<UpdateRow>("SELECT data FROM yjs_updates ORDER BY id ASC")
-				.toArray();
-
-			for (const row of updates) {
-				applyUpdate(doc, new Uint8Array(row.data));
-			}
-		});
-
-		// Write the compacted state and clear updates
-		this.writeSnapshot(encodeStateAsUpdate(doc));
-		this.clearUpdates();
-	}
-
-	/** Empty the updates table and reset the running threshold counters. */
-	private clearUpdates(): void {
+	private compact(doc: Doc): void {
+		const snapshot = encodeStateAsUpdate(doc);
+		this.sql.exec(
+			"INSERT OR REPLACE INTO yjs_snapshot (id, data) VALUES (1, ?)",
+			snapshot.buffer.byteLength !== snapshot.byteLength
+				? snapshot.slice().buffer
+				: snapshot.buffer,
+		);
 		this.sql.exec("DELETE FROM yjs_updates");
 		this.updateCount = 0;
 		this.updateBytes = 0;
-	}
-
-	/**
-	 * Insert or replace the single-row snapshot.
-	 */
-	private writeSnapshot(data: Uint8Array): void {
-		const buffer =
-			data.buffer.byteLength !== data.byteLength
-				? data.slice().buffer
-				: data.buffer;
-
-		this.sql.exec(
-			"INSERT OR REPLACE INTO yjs_snapshot (id, data) VALUES (1, ?)",
-			buffer,
-		);
+		this.snapshotBytes = snapshot.byteLength;
 	}
 }

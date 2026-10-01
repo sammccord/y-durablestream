@@ -18,27 +18,29 @@ import type { Doc } from "yjs";
  */
 export interface YDocStorage {
 	/**
-	 * Load the full persisted document state into a new `Y.Doc`.
+	 * Load the full persisted document state as a single Yjs update.
 	 *
-	 * The implementation should reconstruct the document from whatever
-	 * combination of snapshot + incremental updates it stores.
+	 * Combine stored parts with `Y.mergeUpdates` rather than by applying
+	 * them to a temporary `Doc`: a temporary `Doc` garbage-collects deleted
+	 * content, which loses history for a provider running with `gc: false`.
 	 *
-	 * @returns A new `Doc` containing all persisted state. If no state
-	 *   has ever been persisted, returns an empty `Doc`.
+	 * @returns The persisted state, or `null` if nothing has been persisted.
 	 */
-	getYDoc(): Promise<Doc>;
+	load(): Promise<Uint8Array | null>;
 
 	/**
 	 * Persist a single incremental Yjs document update.
 	 *
-	 * Implementations should buffer updates and auto-compact them into
-	 * a snapshot when the cumulative byte size or count exceeds the
+	 * Implementations should buffer updates and compact them into a
+	 * snapshot of `doc` when the cumulative byte size or count exceeds the
 	 * configured thresholds.
 	 *
-	 * @param update - A raw Yjs encoded update (from `doc.on('update')`
-	 *   or `Y.encodeStateAsUpdate`).
+	 * @param update - A raw Yjs encoded update (from `doc.on('update')`).
+	 * @param doc - The live document that already contains `update`. It is
+	 *   a superset of everything stored, so compaction snapshots it
+	 *   directly instead of rebuilding the document from storage.
 	 */
-	storeUpdate(update: Uint8Array): Promise<void>;
+	storeUpdate(update: Uint8Array, doc: Doc): Promise<void>;
 
 	/**
 	 * Force-compact all incremental updates into a single snapshot.
@@ -61,7 +63,9 @@ export interface YDocStorage {
 export interface YDocStorageOptions {
 	/**
 	 * Maximum total bytes of incremental updates stored before
-	 * automatic compaction into a snapshot.
+	 * automatic compaction into a snapshot. The effective threshold is the
+	 * larger of this and the current snapshot size, so a large document is
+	 * not rewritten in full for every few kilobytes of edits.
 	 *
 	 * For KV storage this must not exceed 128 KB (the Durable Object
 	 * KV storage per-value limit).

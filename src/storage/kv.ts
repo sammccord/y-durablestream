@@ -1,5 +1,6 @@
-import { Doc, applyUpdate, encodeStateAsUpdate } from "yjs";
+import { encodeStateAsUpdate, mergeUpdates } from "yjs";
 
+import type { Doc } from "yjs";
 import type { YDocStorage, YDocStorageOptions } from "./types";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_UPDATES } from "./types";
 
@@ -9,7 +10,7 @@ import { DEFAULT_MAX_BYTES, DEFAULT_MAX_UPDATES } from "./types";
 
 const STATE_DOC_KEY = "ydoc:state:doc";
 /**
- * Single meta key holding both compaction counters. One get + one put per
+ * Single meta key holding the compaction counters. One get + one put per
  * stored update instead of two of each with the legacy split keys.
  */
 const STATE_META_KEY = "ydoc:state:meta";
@@ -22,6 +23,8 @@ const UPDATE_KEY_PREFIX = "ydoc:update:";
 interface StateMeta {
 	bytes: number;
 	count: number;
+	/** Size of the stored snapshot; absent in metas written before 0.10. */
+	snapshotBytes?: number;
 }
 /**
  * Zero-pad the update index so that `list({ prefix })`, which returns
@@ -67,7 +70,7 @@ interface KvTransactionLike {
  * | Key                     | Value                                 |
  * |-------------------------|---------------------------------------|
  * | `ydoc:state:doc`        | `Uint8Array` — compacted doc snapshot |
- * | `ydoc:state:meta`       | `{ bytes, count }` — compaction counters |
+ * | `ydoc:state:meta`       | `{ bytes, count, snapshotBytes }` — compaction counters |
  * | `ydoc:update:<n>`       | `Uint8Array` — incremental update `n` |
  *
  * (Pre-0.9 layouts with split `ydoc:state:bytes` / `ydoc:state:count` keys
@@ -107,44 +110,30 @@ export class DurableObjectKvStorage implements YDocStorage {
 	// YDocStorage implementation
 	// ═════════════════════════════════════
 
-	async getYDoc(): Promise<Doc> {
+	async load(): Promise<Uint8Array | null> {
 		const snapshot = await this.storage.get<Uint8Array>(STATE_DOC_KEY);
 		const updates = await this.storage.list<Uint8Array>({
 			prefix: UPDATE_KEY_PREFIX,
 		});
-
-		const doc = new Doc();
-
-		doc.transact(() => {
-			if (snapshot) {
-				applyUpdate(doc, snapshot);
-			}
-			for (const update of updates.values()) {
-				applyUpdate(doc, update);
-			}
-		});
-
-		return doc;
+		const parts = snapshot ? [snapshot, ...updates.values()] : [...updates.values()];
+		if (parts.length === 0) return null;
+		return parts.length === 1 ? parts[0] : mergeUpdates(parts);
 	}
 
-	async storeUpdate(update: Uint8Array): Promise<void> {
+	async storeUpdate(update: Uint8Array, doc: Doc): Promise<void> {
 		await this.storage.transaction(async (tx) => {
-			const { bytes, count } = await this.loadMeta(tx);
+			const meta = await this.loadMeta(tx);
 
-			const newBytes = bytes + update.byteLength;
-			const newCount = count + 1;
+			const bytes = meta.bytes + update.byteLength;
+			const count = meta.count + 1;
+			const maxBytes = Math.max(this.maxBytes, meta.snapshotBytes ?? 0);
 
-			if (newBytes > this.maxBytes || newCount > this.maxUpdates) {
-				// Threshold exceeded — compact everything.
-				// Re-read the full state from storage so we are
-				// self-contained and do not depend on external doc state.
-				const doc = await this.rebuildDoc(tx);
-				applyUpdate(doc, update);
+			if (bytes > maxBytes || count > this.maxUpdates) {
 				await this.compactInTransaction(tx, doc);
 			} else {
 				// Common path: 1 get (meta) + 2 puts.
-				await tx.put<StateMeta>(STATE_META_KEY, { bytes: newBytes, count: newCount });
-				await tx.put(updateKey(newCount), update);
+				await tx.put<StateMeta>(STATE_META_KEY, { ...meta, bytes, count });
+				await tx.put(updateKey(count), update);
 			}
 		});
 	}
@@ -179,29 +168,6 @@ export class DurableObjectKvStorage implements YDocStorage {
 	}
 
 	/**
-	 * Rebuild a `Doc` from the snapshot and incremental updates
-	 * currently stored within the given transaction context.
-	 */
-	private async rebuildDoc(tx: KvTransactionLike): Promise<Doc> {
-		const snapshot = await tx.get<Uint8Array>(STATE_DOC_KEY);
-		const updates = await tx.list<Uint8Array>({
-			prefix: UPDATE_KEY_PREFIX,
-		});
-
-		const doc = new Doc();
-		doc.transact(() => {
-			if (snapshot) {
-				applyUpdate(doc, snapshot);
-			}
-			for (const u of updates.values()) {
-				applyUpdate(doc, u);
-			}
-		});
-
-		return doc;
-	}
-
-	/**
 	 * Replace all incremental updates with a single compacted snapshot
 	 * within the given transaction context.
 	 *
@@ -221,7 +187,12 @@ export class DurableObjectKvStorage implements YDocStorage {
 			await tx.delete(Array.from(entries.keys()));
 		}
 
-		await tx.put(STATE_DOC_KEY, encodeStateAsUpdate(doc));
-		await tx.put<StateMeta>(STATE_META_KEY, { bytes: 0, count: 0 });
+		const snapshot = encodeStateAsUpdate(doc);
+		await tx.put(STATE_DOC_KEY, snapshot);
+		await tx.put<StateMeta>(STATE_META_KEY, {
+			bytes: 0,
+			count: 0,
+			snapshotBytes: snapshot.byteLength,
+		});
 	}
 }

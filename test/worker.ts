@@ -227,8 +227,8 @@ export class TestCommitCountProvider extends YStreamProvider<Env> {
 			maxUpdates: this.maxUpdates,
 		});
 		return {
-			getYDoc: () => inner.getYDoc(),
-			storeUpdate: (update) => inner.storeUpdate(update),
+			load: () => inner.load(),
+			storeUpdate: (update, doc) => inner.storeUpdate(update, doc),
 			commit: (doc) => {
 				this.commitCount++;
 				return inner.commit(doc);
