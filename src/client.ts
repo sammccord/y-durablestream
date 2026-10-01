@@ -321,7 +321,8 @@ export class YStreamClient {
 		let stream: ReadableStream<Uint8Array>;
 		try {
 			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
-		} catch {
+		} catch (error) {
+			this.onError(error);
 			this.setStatus("disconnected");
 			return;
 		}
@@ -438,9 +439,12 @@ export class YStreamClient {
 					this.handleMessage(msg);
 				}
 			}
-		} catch {
-			// Stream was cancelled (disconnect) or the network
-			// connection was lost.  Exit cleanly.
+		} catch (error) {
+			// A lost connection, an undecodable frame, or a message Yjs
+			// rejects. disconnect() never lands here: cancelling the reader
+			// resolves the pending read as done.
+			this.onError(error);
+			reader.cancel(error).catch(() => {});
 		}
 	}
 
@@ -507,20 +511,24 @@ export class YStreamClient {
 	 * provider's {@link YStreamProviderStub.register} push path for liveness.
 	 *
 	 * Leaves {@link status}/{@link synced} untouched (it is not a persistent
-	 * connection). Always resolves; never rejects.
+	 * connection). Never rejects; failures go to `onError`.
+	 *
+	 * @returns `true` once the provider's state is applied and the local
+	 *   state is sent, `false` if the sync failed or the stream ended first.
 	 */
-	async syncOnce(): Promise<void> {
+	async syncOnce(): Promise<boolean> {
 		const subscriptionId = randomId();
 		let stream: ReadableStream<Uint8Array>;
 		try {
 			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
-		} catch {
-			return;
+		} catch (error) {
+			this.onError(error);
+			return false;
 		}
 
 		const decoder = createMessageDecoder({ maxFrameSize: this.maxFrameSize });
+		let done = false;
 		try {
-			let done = false;
 			for await (const chunk of stream) {
 				for (const msg of decoder.push(chunk)) {
 					const { syncType, reply } = this.decodeSyncMessage(msg);
@@ -533,8 +541,9 @@ export class YStreamClient {
 				}
 				if (done) break;
 			}
-		} catch {
-			// stream error / cancellation — best-effort one-shot
+		} catch (error) {
+			this.onError(error);
+			done = false;
 		} finally {
 			// Breaking out of `for await` cancels the stream iterator locally,
 			// but the cancel does not reach the provider across the RPC
@@ -542,6 +551,7 @@ export class YStreamClient {
 			await this.safeUnsubscribe(subscriptionId);
 			decoder.reset();
 		}
+		return done;
 	}
 
 	/**
