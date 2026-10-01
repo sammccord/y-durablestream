@@ -249,3 +249,55 @@ describe("per-subscription teardown", () => {
 		expect(await consumerCount(provider)).toBe(0);
 	});
 });
+
+describe("client error reporting", () => {
+	it("reports an undecodable frame through onError", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("oversized-frame"));
+		await provider.applyUpdate(createTextUpdate("root", "more than sixteen bytes of content"));
+		const errors: unknown[] = [];
+		const client = new YStreamClient(new Doc(), {
+			stub: stubFor(provider),
+			maxFrameSize: 16,
+			onError: (error) => errors.push(error),
+		});
+
+		await client.connect();
+
+		expect(errors).toContainEqual(expect.objectContaining({ name: "FrameDecodeError" }));
+		await waitFor(async () => (await consumerCount(provider)) === 0);
+	});
+
+	it("reports a failed subscribe through onError", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("failed-subscribe"));
+		const errors: unknown[] = [];
+		const client = new YStreamClient(new Doc(), {
+			stub: stubFor(provider, {
+				subscribe: async () => {
+					throw new Error("provider unavailable");
+				},
+			}),
+			onError: (error) => errors.push(error),
+		});
+
+		await client.connect();
+
+		expect(errors.map(String)).toEqual(["Error: provider unavailable"]);
+	});
+
+	it("syncOnce() resolves true on success and false on failure", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("sync-once-result"));
+		const ok = new YStreamClient(new Doc(), { stub: stubFor(provider) });
+		const failing = new YStreamClient(new Doc(), {
+			stub: stubFor(provider, {
+				subscribe: async () => {
+					throw new Error("provider unavailable");
+				},
+			}),
+			onError: () => {},
+		});
+
+		expect(await ok.syncOnce()).toBe(true);
+		expect(await failing.syncOnce()).toBe(false);
+		await waitFor(async () => (await consumerCount(provider)) === 0);
+	});
+});
