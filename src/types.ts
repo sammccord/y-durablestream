@@ -156,11 +156,12 @@ export interface YStreamClientOptions {
 	interest?: string[];
 
 	/**
-	 * Called when a background send to the provider fails (a fire-and-forget
-	 * `stub.update` from the doc `update` handler or a SyncStep reply). Without
-	 * this hook such failures are logged; they never become unhandled promise
-	 * rejections. The failed update is not retried — the next SyncStep1/2
-	 * handshake (reconnect or `syncOnce`) recovers any missed state.
+	 * Called when the client hits an error it handles itself: a failed
+	 * `subscribe`, a stream that errors or carries a frame it cannot decode
+	 * (for example one larger than `maxFrameSize`), or a failed background
+	 * send to the provider. Without this hook such errors are logged; they
+	 * never become unhandled promise rejections. Nothing is retried here —
+	 * reconnection or the next `syncOnce` handshake recovers missed state.
 	 */
 	onError?: (error: unknown) => void;
 }
