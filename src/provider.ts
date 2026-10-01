@@ -131,7 +131,7 @@ function createSyncUpdateMessage(update: Uint8Array): Uint8Array {
  * export class DocProvider extends YStreamProvider<Env> {}
  *
  * // SQLite storage
- * import { DurableObjectSqlStorage } from "y-stream";
+ * import { DurableObjectSqlStorage } from "y-durablestream";
  * export class SqlDocProvider extends YStreamProvider<Env> {
  *   protected override createStorage() {
  *     return new DurableObjectSqlStorage(this.ctx.storage);
@@ -197,8 +197,10 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 
 	/**
 	 * Maximum total bytes of incremental updates stored before automatic
-	 * compaction into a snapshot.  Override in a subclass constructor
-	 * (before `super()` returns) or in {@link createStorage}.
+	 * compaction into a snapshot. Set it with the `maxBytes` constructor
+	 * option: a subclass field initializer runs only after the base
+	 * constructor has already called {@link createStorage}, so it has no
+	 * effect on the built-in storage.
 	 *
 	 * For KV storage this must not exceed 128 KB (Durable Object KV
 	 * per-value limit).
@@ -209,8 +211,8 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 
 	/**
 	 * Maximum number of incremental updates stored before automatic
-	 * compaction into a snapshot.  Override in a subclass constructor
-	 * (before `super()` returns) or in {@link createStorage}.
+	 * compaction into a snapshot. Set it with the `maxUpdates` constructor
+	 * option, for the same reason as {@link maxBytes}.
 	 *
 	 * @default 500
 	 */
@@ -271,15 +273,17 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * Factory method that creates the storage backend.
 	 *
 	 * Override this in a subclass to use a different persistence
-	 * implementation.  The method is called once during construction,
-	 * **after** {@link maxBytes} and {@link maxUpdates} have been
-	 * initialised but **before** {@link onStart}.
+	 * implementation.  The method is called once from the base
+	 * constructor, **after** {@link maxBytes} and {@link maxUpdates} have
+	 * been initialised but **before** {@link onStart}. Because it runs
+	 * before the subclass's own field initializers, it must not read fields
+	 * the subclass declares; they are still `undefined`.
 	 *
 	 * @returns A {@link YDocStorage} instance.
 	 *
 	 * @example
 	 * ```ts
-	 * import { DurableObjectSqlStorage } from "y-stream";
+	 * import { DurableObjectSqlStorage } from "y-durablestream";
 	 *
 	 * export class SqlDocProvider extends YStreamProvider<Env> {
 	 *   protected override createStorage() {
@@ -393,8 +397,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * thus how a routing key maps to content — is application-specific.
 	 *
 	 * @param interest - The subscriber's interest set, or `undefined` for full
-	 *   sync (also `undefined` on a `"resync"` rebuild, which uses the consumer's
-	 *   current interest via {@link createConsumer}).
+	 *   sync. A `"resync"` rebuild passes the consumer's current interest.
 	 */
 	protected buildInitialFrames(interest?: readonly string[]): Uint8Array[] {
 		void interest; // full-sync default; subclasses filter by interest
