@@ -22,11 +22,11 @@ import type {
 const MESSAGE_SYNC = 0;
 
 /**
- * Generate a globally unique client id.  The workerd runtime provides a
+ * Generate a globally unique id.  The workerd runtime provides a
  * standard global `crypto`; it is accessed via `globalThis` so the module
  * does not depend on a particular ambient `crypto` type declaration.
  */
-function generateClientId(): string {
+function randomId(): string {
 	return (
 		globalThis as unknown as { crypto: { randomUUID(): string } }
 	).crypto.randomUUID();
@@ -160,7 +160,7 @@ export class YStreamClient {
 	constructor(doc: Doc, options: YStreamClientOptions) {
 		this.doc = doc;
 		this.stub = options.stub;
-		this.clientId = options.clientId ?? generateClientId();
+		this.clientId = options.clientId ?? randomId();
 		this.maxFrameSize = options.maxFrameSize;
 		this.interest = options.interest;
 		this.onError =
@@ -317,17 +317,21 @@ export class YStreamClient {
 	private async connectOnce(): Promise<void> {
 		this.setStatus("connecting");
 
+		const subscriptionId = randomId();
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe(this.clientId, this.interest);
+			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
 		} catch {
 			this.setStatus("disconnected");
 			return;
 		}
 
 		// If disconnect() was called while we were awaiting subscribe(),
-		// abort immediately without entering the read loop.
+		// skip the read loop but still release the provider-side consumer
+		// that subscribe() just created.
 		if (this._disposed) {
+			stream.cancel().catch(() => {});
+			await this.safeUnsubscribe(subscriptionId);
 			this.teardown();
 			return;
 		}
@@ -366,7 +370,7 @@ export class YStreamClient {
 		// boundary never reaches the provider's cancel callback, so without
 		// this the consumer stays registered until the provider DO is
 		// evicted. Awaited so a reconnect's fresh subscribe() cannot race it.
-		await this.safeUnsubscribe();
+		await this.safeUnsubscribe(subscriptionId);
 
 		// Clean up resources after the read loop exits.
 		// This is the ONLY place teardown is called during an active
@@ -506,9 +510,10 @@ export class YStreamClient {
 	 * connection). Always resolves; never rejects.
 	 */
 	async syncOnce(): Promise<void> {
+		const subscriptionId = randomId();
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe(this.clientId, this.interest);
+			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
 		} catch {
 			return;
 		}
@@ -534,19 +539,21 @@ export class YStreamClient {
 			// Breaking out of `for await` cancels the stream iterator locally,
 			// but the cancel does not reach the provider across the RPC
 			// boundary — tell it explicitly so our consumer is removed.
-			await this.safeUnsubscribe();
+			await this.safeUnsubscribe(subscriptionId);
 			decoder.reset();
 		}
 	}
 
 	/**
-	 * Ask the provider to drop this client's stream consumers. Tolerates
-	 * pre-0.9 providers (no `unsubscribe` RPC) and unreachable providers —
-	 * in both cases there is nothing further to clean up from here.
+	 * Ask the provider to drop the stream consumer for one subscription.
+	 * Tolerates pre-0.9 providers (no `unsubscribe` RPC) and unreachable
+	 * providers — in both cases there is nothing further to clean up from
+	 * here. A 0.9.0 provider ignores `subscriptionId` and drops every
+	 * stream for this `clientId`.
 	 */
-	private async safeUnsubscribe(): Promise<void> {
+	private async safeUnsubscribe(subscriptionId: string): Promise<void> {
 		try {
-			await this.stub.unsubscribe?.(this.clientId);
+			await this.stub.unsubscribe?.(this.clientId, subscriptionId);
 		} catch {
 			// Provider unreachable/evicted — its consumer state is gone anyway.
 		}

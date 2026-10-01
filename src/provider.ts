@@ -366,6 +366,9 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 *   updates whose key is in the set, and its initial sync is built via
 	 *   {@link buildInitialFrames} with this interest (a subclass filters the
 	 *   snapshot accordingly). Omit for full sync.
+	 * @param subscriptionId - Optional id for this one stream. Pass it to
+	 *   {@link unsubscribe} to drop this stream without touching other
+	 *   streams that share `clientId`.
 	 * @returns A `ReadableStream<Uint8Array>` that delivers length-framed
 	 *   Yjs sync protocol messages.  The initial burst contains
 	 *   SyncStep1 + SyncStep2; subsequent chunks are incremental
@@ -374,11 +377,13 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	async subscribe(
 		clientId?: string,
 		interest?: string[],
+		subscriptionId?: string,
 	): Promise<ReadableStream<Uint8Array>> {
 		const consumer = this.broadcast.createConsumer(
 			this.buildInitialFrames(interest),
 			clientId,
 			interest,
+			subscriptionId,
 		);
 		return consumer.readable;
 	}
@@ -522,9 +527,12 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * that just cancels (or drops) its stream leaves its consumer registered
 	 * here until eviction. {@link YStreamClient} calls this automatically after
 	 * every stream teardown and `syncOnce`. Idempotent.
+	 *
+	 * @param subscriptionId - When given, drop only the stream subscribed
+	 *   with this id; otherwise drop every stream for `clientId`.
 	 */
-	async unsubscribe(clientId: string): Promise<void> {
-		this.broadcast.removeByClientId(clientId);
+	async unsubscribe(clientId: string, subscriptionId?: string): Promise<void> {
+		this.broadcast.removeByClientId(clientId, subscriptionId);
 	}
 
 	// ═════════════════════════════════════

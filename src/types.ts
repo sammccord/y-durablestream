@@ -14,8 +14,15 @@ export interface YStreamProviderStub {
 	 *   provided, it receives only keyless (control) frames and keyed updates
 	 *   whose key is in the set, and an interest-scoped initial sync. Omit for
 	 *   full sync.
+	 * @param subscriptionId Optional id for this one stream, so
+	 *   {@link unsubscribe} can drop it without touching other streams that
+	 *   share `clientId`.
 	 */
-	subscribe(clientId?: string, interest?: string[]): Promise<ReadableStream<Uint8Array>>;
+	subscribe(
+		clientId?: string,
+		interest?: string[],
+		subscriptionId?: string,
+	): Promise<ReadableStream<Uint8Array>>;
 
 	/**
 	 * Send a Yjs sync protocol message to the provider.
@@ -65,9 +72,12 @@ export interface YStreamProviderStub {
 	 * after ending a stream (`YStreamClient` does it automatically) so the
 	 * provider can clean up deterministically. Idempotent.
 	 *
+	 * Pass the `subscriptionId` given to {@link subscribe} to drop only that
+	 * stream; omit it to drop every stream for `clientId`.
+	 *
 	 * Optional so stubs generated against pre-0.9 providers still typecheck.
 	 */
-	unsubscribe?(clientId: string): Promise<void>;
+	unsubscribe?(clientId: string, subscriptionId?: string): Promise<void>;
 }
 
 /**
