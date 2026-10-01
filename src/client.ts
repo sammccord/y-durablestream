@@ -114,6 +114,13 @@ export class YStreamClient {
 	 */
 	private _disposed = false;
 
+	/**
+	 * Whether a {@link connect} call is in progress, from its first
+	 * subscribe through its last reconnect attempt. Status alone cannot
+	 * answer this: it passes through every state while the loop runs.
+	 */
+	private running = false;
+
 	/** Registered doc 'update' handler, stored so it can be removed. */
 	private updateHandler: ((update: Uint8Array, origin: unknown) => void) | null =
 		null;
@@ -239,13 +246,16 @@ export class YStreamClient {
 	 * after all retry attempts have been exhausted or {@link disconnect}
 	 * is called.
 	 *
-	 * Calling `connect()` while already connected is a no-op — it
-	 * returns immediately without error.
+	 * Status becomes `"disconnected"` exactly once per call, after the
+	 * connection (and any reconnect attempts) has ended, so a listener may
+	 * call `connect()` from there to start again.
+	 *
+	 * Calling `connect()` while a previous call is still running is a
+	 * no-op — it returns immediately without error.
 	 */
 	async connect(): Promise<void> {
-		if (this._status !== "disconnected") {
-			return;
-		}
+		if (this.running) return;
+		this.running = true;
 
 		// Clear the disposed flag once, here — not inside connectOnce.
 		// Resetting it per-attempt created a race where a disconnect()
@@ -253,6 +263,16 @@ export class YStreamClient {
 		// connectOnce() was silently discarded.
 		this._disposed = false;
 
+		try {
+			await this.run();
+		} finally {
+			this.running = false;
+			this.setStatus("disconnected");
+		}
+	}
+
+	/** Connect once, or keep reconnecting with backoff when enabled. */
+	private async run(): Promise<void> {
 		if (!this.reconnectOptions) {
 			return this.connectOnce();
 		}
@@ -299,10 +319,7 @@ export class YStreamClient {
 			});
 
 			// disconnect() may have been called while we were sleeping.
-			if (this._disposed) {
-				this.setStatus("disconnected");
-				return;
-			}
+			if (this._disposed) return;
 
 			attempt++;
 		}
@@ -323,7 +340,6 @@ export class YStreamClient {
 			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
 		} catch (error) {
 			this.onError(error);
-			this.setStatus("disconnected");
 			return;
 		}
 
@@ -396,9 +412,7 @@ export class YStreamClient {
 	 * Safe to call multiple times or when not connected.
 	 */
 	disconnect(): void {
-		if (this._status === "disconnected") {
-			return;
-		}
+		if (!this.running) return;
 
 		// Signal that the client is shutting down.  This is checked by
 		// connect() after async operations to detect a disconnect that
@@ -646,7 +660,6 @@ export class YStreamClient {
 		}
 
 		this._synced = false;
-		this.setStatus("disconnected");
 	}
 
 	/**

@@ -200,7 +200,7 @@ const client = new YStreamClient(doc, { stub });
 
 | Property | Type | Description |
 |---|---|---|
-| `status` | `YStreamClientStatus` | Current status: `"disconnected"` \| `"connecting"` \| `"connected"` \| `"synced"` |
+| `status` | `YStreamClientStatus` | Current status: `"disconnected"` \| `"connecting"` \| `"connected"` \| `"synced"` \| `"reconnecting"`. `"disconnected"` fires once per `connect()` call, after it has fully ended. |
 | `synced` | `boolean` | Whether initial sync with the provider has completed. |
 
 ---
