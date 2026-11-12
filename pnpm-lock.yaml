@@ -14,9 +14,6 @@ importers:
       y-protocols:
         specifier: ^1.0.6
         version: 1.0.7(yjs@13.6.31)
-      yjs:
-        specifier: ^13.6.24
-        version: 13.6.31
     devDependencies:
       '@changesets/cli':
         specifier: ^2.29.2
@@ -45,6 +42,9 @@ importers:
       wrangler:
         specifier: ^4.63.0
         version: 4.106.0
+      yjs:
+        specifier: ^13.6.24
+        version: 13.6.31
 
 packages:
 
@@ -135,6 +135,7 @@ packages:
 
   '@cloudflare/vitest-pool-workers@0.12.21':
     resolution: {integrity: sha512-xqvqVR+qAhekXWaTNY36UtFFmHrz13yGUoWVGOu6LDC2ABiQqI1E1lQ3eUZY8KVB+1FXY/mP5dB6oD07XUGnPg==}
+    deprecated: '@cloudflare/vitest-pool-workers has been renamed to @cloudflare/vitest-plugin. This package will not receive future updates.'
     peerDependencies:
       '@vitest/runner': 2.0.x - 3.2.x
       '@vitest/snapshot': 2.0.x - 3.2.x

@@ -12,6 +12,7 @@ Fix a subscriber stream stall, storage data-loss cases, and silent client failur
 - **Errors**: undecodable frames/messages and failed `subscribe()` calls reach `onError` instead of vanishing. `syncOnce()` resolves to `true`/`false`.
 - **Status**: `status` no longer reports `"disconnected"` between reconnect attempts, only once `connect()` is over.
 - Reconnect backoff is jittered, an empty SyncStep2 reply is no longer sent, and KV compaction deletes keys in batches of 128.
+- **`yjs` is now a peer dependency**, so the package uses your application's copy instead of possibly installing a second one (duplicate Yjs copies break sync). Install `yjs` alongside it if your package manager does not add peers automatically.
 
 Performance:
 

@@ -34,10 +34,10 @@ Yjs document synchronization between Cloudflare Durable Objects via `ReadableStr
 ## Installation
 
 ```bash
-npm install y-durablestream
+npm install y-durablestream yjs
 ```
 
-`yjs`, `y-protocols`, and `lib0` are included as dependencies and do not need to be installed separately.
+`yjs` is a peer dependency, so the package shares your application's single copy (two copies of Yjs in one bundle break document sync). `y-protocols` and `lib0` are included as dependencies.
 
 ## Quick Start
 
