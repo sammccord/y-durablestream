@@ -62,7 +62,9 @@
 	},
 	"dependencies": {
 		"lib0": "^0.2.104",
-		"y-protocols": "^1.0.6",
+		"y-protocols": "^1.0.6"
+	},
+	"peerDependencies": {
 		"yjs": "^13.6.24"
 	},
 	"devDependencies": {
@@ -74,6 +76,7 @@
 		"tsup": "^8.4.0",
 		"typescript": "^5.8.3",
 		"vitest": "~3.2.0",
-		"wrangler": "^4.63.0"
+		"wrangler": "^4.63.0",
+		"yjs": "^13.6.24"
 	}
 }

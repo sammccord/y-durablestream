@@ -1,29 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 import { createDecoder, readVarUint } from "lib0/decoding";
-import {
-	createEncoder,
-	length,
-	toUint8Array,
-	writeVarUint,
-} from "lib0/encoding";
-import {
-	readSyncMessage,
-	writeSyncStep1,
-	writeSyncStep2,
-	writeUpdate,
-} from "y-protocols/sync";
+import { createEncoder, length, toUint8Array, writeVarUint } from "lib0/encoding";
+import { readSyncMessage } from "y-protocols/sync";
 import { Doc, applyUpdate, encodeStateAsUpdate, mergeUpdates } from "yjs";
 
 import { BroadcastBuffer } from "./broadcast";
 import { DEFAULT_MAX_FRAME_SIZE, encodeMessage } from "./protocol";
 import { DurableObjectKvStorage } from "./storage/kv";
-
+import { MESSAGE_SYNC, createSyncUpdateMessage, encodeInitialSync } from "./sync";
 
 import type { YDocStorage } from "./storage/types";
 import type { YStreamProviderOptions } from "./types";
-
-/** Yjs sync protocol outer message type identifier. */
-const MESSAGE_SYNC = 0;
 
 /**
  * Byte length of an empty document encoded via `encodeStateAsUpdate`.
@@ -59,51 +46,12 @@ interface BroadcastOrigin {
 }
 
 // ═══════════════════════════════════════════════════════════
-// Sync message helpers
-// ═══════════════════════════════════════════════════════════
-
-/**
- * Create a sync protocol message containing SyncStep1 (state vector).
- * The subscriber should process this and respond with a SyncStep2 via
- * {@link YStreamProvider.update} to send any data the provider lacks.
- */
-function createSyncStep1Message(doc: Doc): Uint8Array {
-	const encoder = createEncoder();
-	writeVarUint(encoder, MESSAGE_SYNC);
-	writeSyncStep1(encoder, doc);
-	return toUint8Array(encoder);
-}
-
-/**
- * Create a sync protocol message containing SyncStep2 (full doc state).
- * This delivers the entire document content to a new subscriber so it
- * can be applied immediately without waiting for a round-trip.
- */
-function createSyncStep2Message(doc: Doc): Uint8Array {
-	const encoder = createEncoder();
-	writeVarUint(encoder, MESSAGE_SYNC);
-	writeSyncStep2(encoder, doc);
-	return toUint8Array(encoder);
-}
-
-/**
- * Create a sync protocol message wrapping an incremental Y.Doc update.
- * Used for broadcasting changes after the initial sync has completed.
- */
-function createSyncUpdateMessage(update: Uint8Array): Uint8Array {
-	const encoder = createEncoder();
-	writeVarUint(encoder, MESSAGE_SYNC);
-	writeUpdate(encoder, update);
-	return toUint8Array(encoder);
-}
-
-// ═══════════════════════════════════════════════════════════
 // YStreamProvider
 // ═══════════════════════════════════════════════════════════
 
 /**
  * A Durable Object that hosts an authoritative Yjs document and streams
- * document updates to subscriber Durable Objects via `TransformStream`.
+ * document updates to subscriber Durable Objects via `ReadableStream`.
  *
  * ## Subscription protocol
  *
@@ -114,8 +62,8 @@ function createSyncUpdateMessage(update: Uint8Array): Uint8Array {
  * 1. **SyncStep1** – the provider's state vector.  The subscriber should
  *    process this (which produces a SyncStep2 response carrying any data
  *    the provider is missing) and send it back via {@link update}.
- * 2. **SyncStep2** – the complete document content so the subscriber has
- *    the full doc without waiting for the SyncStep1 round-trip.
+ * 2. **SyncStep2** – the document content the subscriber lacks: all of it,
+ *    or the diff against the state vector it passed to {@link subscribe}.
  *
  * After the initial burst, incremental updates are streamed as
  * sync Update messages whenever the document changes.
@@ -138,7 +86,7 @@ function createSyncUpdateMessage(update: Uint8Array): Uint8Array {
  * export class DocProvider extends YStreamProvider<Env> {}
  *
  * // SQLite storage
- * import { DurableObjectSqlStorage } from "y-stream";
+ * import { DurableObjectSqlStorage } from "y-durablestream";
  * export class SqlDocProvider extends YStreamProvider<Env> {
  *   protected override createStorage() {
  *     return new DurableObjectSqlStorage(this.ctx.storage);
@@ -204,8 +152,9 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 
 	/**
 	 * Maximum total bytes of incremental updates stored before automatic
-	 * compaction into a snapshot.  Override in a subclass constructor
-	 * (before `super()` returns) or in {@link createStorage}.
+	 * compaction into a snapshot.  Set it via the `maxBytes` constructor
+	 * option: {@link createStorage} runs inside the base constructor, so a
+	 * subclass field initializer or assignment after `super()` is too late.
 	 *
 	 * For KV storage this must not exceed 128 KB (Durable Object KV
 	 * per-value limit).
@@ -216,8 +165,8 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 
 	/**
 	 * Maximum number of incremental updates stored before automatic
-	 * compaction into a snapshot.  Override in a subclass constructor
-	 * (before `super()` returns) or in {@link createStorage}.
+	 * compaction into a snapshot.  Set it via the `maxUpdates` constructor
+	 * option (see {@link maxBytes}).
 	 *
 	 * @default 500
 	 */
@@ -242,6 +191,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		this.notifyDebounceMs = options?.notifyDebounceMs ?? 0;
 		this.broadcast = new BroadcastBuffer({
 			highWaterMark: options?.streamHighWaterMark ?? 64,
+			highWaterBytes: options?.streamHighWaterBytes,
 			backpressure: options?.backpressure ?? "resync",
 			onEmpty: () => {
 				// Compact storage once no subscribers remain — but only when
@@ -286,7 +236,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 *
 	 * @example
 	 * ```ts
-	 * import { DurableObjectSqlStorage } from "y-stream";
+	 * import { DurableObjectSqlStorage } from "y-durablestream";
 	 *
 	 * export class SqlDocProvider extends YStreamProvider<Env> {
 	 *   protected override createStorage() {
@@ -313,12 +263,17 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * Subclasses may override this but **must** call `super.onStart()`.
 	 */
 	protected async onStart(): Promise<void> {
-		const persisted = await this.storage.getYDoc();
-		const state = encodeStateAsUpdate(persisted);
-		if (state.byteLength > EMPTY_DOC_UPDATE_BYTES) {
-			// Only apply if there is meaningful content (an empty doc
-			// encodes to a 2-byte update).
-			applyUpdate(this.doc, state);
+		if (this.storage.loadInto) {
+			// Apply persisted state straight to the live document.
+			await this.storage.loadInto(this.doc);
+		} else {
+			const persisted = await this.storage.getYDoc();
+			const state = encodeStateAsUpdate(persisted);
+			if (state.byteLength > EMPTY_DOC_UPDATE_BYTES) {
+				// Only apply if there is meaningful content (an empty doc
+				// encodes to a 2-byte update).
+				applyUpdate(this.doc, state);
+			}
 		}
 
 		// Restore the push-subscriber registry persisted across evictions
@@ -369,6 +324,9 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * @param subscriptionId - Optional id for this one stream. Pass it to
 	 *   {@link unsubscribe} to drop this stream without touching other
 	 *   streams that share `clientId`.
+	 * @param stateVector - Optional Yjs state vector of the subscriber's
+	 *   document (`Y.encodeStateVector`). When provided, the initial SyncStep2
+	 *   carries only what the subscriber lacks instead of the whole document.
 	 * @returns A `ReadableStream<Uint8Array>` that delivers length-framed
 	 *   Yjs sync protocol messages.  The initial burst contains
 	 *   SyncStep1 + SyncStep2; subsequent chunks are incremental
@@ -378,9 +336,10 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		clientId?: string,
 		interest?: string[],
 		subscriptionId?: string,
+		stateVector?: Uint8Array,
 	): Promise<ReadableStream<Uint8Array>> {
 		const consumer = this.broadcast.createConsumer(
-			this.buildInitialFrames(interest),
+			this.buildInitialFrames(interest, stateVector),
 			clientId,
 			interest,
 			subscriptionId,
@@ -390,7 +349,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 
 	/**
 	 * Build the initial sync burst for a (re)connecting consumer:
-	 * SyncStep1 + SyncStep2 packed into a single framed buffer.
+	 * SyncStep1 + SyncStep2, each split into frames.
 	 *
 	 * Delivered as the consumer's `initialFrames` so they are drained
 	 * before it starts reading from the shared broadcast buffer.  This
@@ -407,16 +366,19 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 	 * @param interest - The subscriber's interest set, or `undefined` for full
 	 *   sync (also `undefined` on a `"resync"` rebuild, which uses the consumer's
 	 *   current interest via {@link createConsumer}).
+	 * @param stateVector - The subscriber's state vector when it supplied one
+	 *   to {@link subscribe}; the SyncStep2 is then a diff against it. Always
+	 *   `undefined` on a `"resync"` rebuild, which sends full state.
 	 */
-	protected buildInitialFrames(interest?: readonly string[]): Uint8Array[] {
+	protected buildInitialFrames(
+		interest?: readonly string[],
+		stateVector?: Uint8Array,
+	): Uint8Array[] {
 		void interest; // full-sync default; subclasses filter by interest
 		// Each message is chunked into `frameChunkSize` frames so a full-document
 		// SyncStep2 larger than the frame cap is split (and reassembled by the
-		// client) rather than rejected. SyncStep1 is small (a single frame).
-		return [
-			...encodeMessage(createSyncStep1Message(this.doc), this.frameChunkSize),
-			...encodeMessage(createSyncStep2Message(this.doc), this.frameChunkSize),
-		];
+		// client) rather than rejected.
+		return encodeInitialSync(this.doc, this.frameChunkSize, stateVector);
 	}
 
 	/**
@@ -555,7 +517,7 @@ export class YStreamProvider<E = unknown> extends DurableObject<E> {
 		this.notifySubscribers(update, originId, key);
 		this.dirtySinceCommit = true;
 		this.ctx.waitUntil(
-			this.storage.storeUpdate(update).catch((err) => {
+			this.storage.storeUpdate(update, this.doc).catch((err) => {
 				this.onStorageError(err);
 			}),
 		);

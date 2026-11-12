@@ -27,6 +27,8 @@ interface BufferEntry {
 	frame: Uint8Array;
 	/** Interest routing key; `undefined` = control frame delivered to all. */
 	key: string | undefined;
+	/** Total bytes pushed to the buffer up to and including this frame. */
+	endOffset: number;
 }
 
 /** Per-consumer bookkeeping. */
@@ -114,6 +116,15 @@ export interface BroadcastBufferOptions {
 	highWaterMark?: number;
 
 	/**
+	 * Maximum bytes of frames a consumer may be behind before the
+	 * backpressure policy kicks in. Bounds memory when frames are large,
+	 * where the frame-count mark alone would not. A consumer is never
+	 * treated as lagging for a single frame, however large.
+	 * @default 16777216 (16 MB)
+	 */
+	highWaterBytes?: number;
+
+	/**
 	 * What to do when a consumer falls behind.
 	 * @default "resync"
 	 */
@@ -166,10 +177,14 @@ export class BroadcastBuffer {
 	 */
 	private baseIndex = 0;
 
+	/** Total bytes ever pushed; frame positions are offsets into this. */
+	private pushedBytes = 0;
+
 	private consumers = new Map<number, ConsumerState>();
 	private nextId = 0;
 
 	private readonly highWaterMark: number;
+	private readonly highWaterBytes: number;
 	private readonly backpressure: BackpressurePolicy;
 	private readonly onEmpty?: () => void;
 	private readonly onResync?: (interest: Set<string> | null) => Uint8Array[];
@@ -177,6 +192,7 @@ export class BroadcastBuffer {
 
 	constructor(options?: BroadcastBufferOptions) {
 		this.highWaterMark = options?.highWaterMark ?? 64;
+		this.highWaterBytes = options?.highWaterBytes ?? 16 * 1024 * 1024;
 		this.backpressure = options?.backpressure ?? "resync";
 		this.onEmpty = options?.onEmpty;
 		this.onResync = options?.onResync;
@@ -200,7 +216,8 @@ export class BroadcastBuffer {
 	push(frame: Uint8Array, opts?: PushOptions): void {
 		const originId = opts?.originId;
 		const headBefore = this.baseIndex + this.buffer.length;
-		this.buffer.push({ frame, key: opts?.key });
+		this.pushedBytes += frame.byteLength;
+		this.buffer.push({ frame, key: opts?.key, endOffset: this.pushedBytes });
 		const headAfter = this.baseIndex + this.buffer.length;
 
 		// Skip echoing the frame back to its originator when that consumer
@@ -220,9 +237,10 @@ export class BroadcastBuffer {
 		// Apply backpressure per-consumer before waking them.
 		this.applyBackpressure();
 
-		// Wake any consumers that were waiting for data.
+		// Wake any consumers that were waiting for data. A consumer already at
+		// the head (the echo-suppressed originator) has nothing to read.
 		for (const consumer of this.consumers.values()) {
-			if (consumer.resolver && !consumer.cancelled) {
+			if (consumer.resolver && !consumer.cancelled && consumer.cursor < headAfter) {
 				const resolve = consumer.resolver;
 				consumer.resolver = null;
 				resolve();
@@ -285,35 +303,33 @@ export class BroadcastBuffer {
 				// Any pull proves the consumer is alive — clear the stale marker.
 				state.resyncPendingSince = null;
 
-				// 1. Drain per-consumer initial frames first.
-				if (state.initialFrames.length > 0) {
-					const frame = state.initialFrames.shift()!;
-					controller.enqueue(frame);
-					return;
-				}
+				// Deliver exactly one chunk, parking until one exists. A pull that
+				// resolves without enqueuing is never called again by the stream
+				// (a no-op pull is not retried), so a wake that yields nothing
+				// deliverable — a frame outside this consumer's interest, or a
+				// setInterest change — must park again here rather than return.
+				while (!state.cancelled) {
+					// Per-consumer initial frames (connect or resync burst) go first.
+					const initial = state.initialFrames.shift();
+					if (initial !== undefined) {
+						controller.enqueue(initial);
+						return;
+					}
 
-				// 2. Deliver the next frame this consumer is interested in.
-				//    takeNext may skip (advance past) non-interest frames, so
-				//    trim after it even when nothing is delivered — otherwise a
-				//    consumer that skips everything would advance its cursor but
-				//    never let the buffer reclaim those frames.
-				let frame = this.takeNext(state);
-				this.tryTrimBuffer();
-				if (frame !== null) {
-					controller.enqueue(frame);
-					return;
-				}
+					// takeNext may skip (advance past) non-interest frames, so trim
+					// after it even when nothing is delivered — otherwise a consumer
+					// that skips everything would advance its cursor but never let
+					// the buffer reclaim those frames.
+					const frame = this.takeNext(state);
+					this.tryTrimBuffer();
+					if (frame !== null) {
+						controller.enqueue(frame);
+						return;
+					}
 
-				// 3. No deliverable data — wait for the next push()/setInterest.
-				await new Promise<void>((resolve) => {
-					state.resolver = resolve;
-				});
-				if (state.cancelled) return;
-
-				frame = this.takeNext(state);
-				this.tryTrimBuffer();
-				if (frame !== null) {
-					controller.enqueue(frame);
+					await new Promise<void>((resolve) => {
+						state.resolver = resolve;
+					});
 				}
 			},
 
@@ -471,8 +487,11 @@ export class BroadcastBuffer {
 		const lagging: ConsumerState[] = [];
 		for (const consumer of this.consumers.values()) {
 			if (consumer.cancelled) continue;
-			if (head - consumer.cursor <= this.highWaterMark) continue;
-			lagging.push(consumer);
+			const framesBehind = head - consumer.cursor;
+			const lagsByCount = framesBehind > this.highWaterMark;
+			const lagsByBytes =
+				framesBehind > 1 && this.bytesBehind(consumer) > this.highWaterBytes;
+			if (lagsByCount || lagsByBytes) lagging.push(consumer);
 		}
 
 		if (lagging.length === 0) return;
@@ -531,6 +550,13 @@ export class BroadcastBuffer {
 		// Reclaim buffer entries no consumer needs any more now that the
 		// laggards have been fast-forwarded.
 		this.tryTrimBuffer();
+	}
+
+	/** Bytes of buffered frames at or after the consumer's cursor. */
+	private bytesBehind(consumer: ConsumerState): number {
+		const next = this.buffer[Math.max(0, consumer.cursor - this.baseIndex)];
+		if (next === undefined) return 0;
+		return this.pushedBytes - (next.endOffset - next.frame.byteLength);
 	}
 
 	/**

@@ -344,12 +344,14 @@ describe("DurableObjectKvStorage", () => {
 				if (key === "ydoc:state:meta") return { bytes: 99999, count: 3 };
 				return undefined;
 			});
-			storage.list.mockResolvedValue(
-				new Map([
-					["ydoc:update:1", existingUpdate1],
-					["ydoc:update:2", existingUpdate2],
-					["ydoc:update:3", existingUpdate3],
-				]),
+			storage.list.mockImplementation(async (options?: { prefix?: string }) =>
+				options?.prefix === "ydoc:update:"
+					? new Map([
+							["ydoc:update:1", existingUpdate1],
+							["ydoc:update:2", existingUpdate2],
+							["ydoc:update:3", existingUpdate3],
+						])
+					: new Map(),
 			);
 
 			const update = createUpdateFromText("d", "4");
@@ -361,6 +363,31 @@ describe("DurableObjectKvStorage", () => {
 				"ydoc:update:2",
 				"ydoc:update:3",
 			]);
+		});
+
+		it("reads the counters once, then stores each update with two puts and no read", async () => {
+			const kvStorage = new DurableObjectKvStorage(storage);
+			await kvStorage.storeUpdate(new Uint8Array([1]));
+			storage.get.mockClear();
+			storage.put.mockClear();
+
+			await kvStorage.storeUpdate(new Uint8Array([2]));
+
+			expect(storage.get).not.toHaveBeenCalled();
+			expect(storage.put).toHaveBeenCalledTimes(2);
+			expect(storage.put).toHaveBeenCalledWith("ydoc:update:00000000000000000002", new Uint8Array([2]));
+		});
+
+		it("re-reads the counters after a failed transaction", async () => {
+			const kvStorage = new DurableObjectKvStorage(storage);
+			await kvStorage.storeUpdate(new Uint8Array([1]));
+			storage.put.mockRejectedValueOnce(new Error("put failed"));
+			await expect(kvStorage.storeUpdate(new Uint8Array([2]))).rejects.toThrow("put failed");
+			storage.get.mockClear();
+
+			await kvStorage.storeUpdate(new Uint8Array([3]));
+
+			expect(storage.get).toHaveBeenCalledWith("ydoc:state:meta");
 		});
 
 		it("does not compact when under both thresholds", async () => {
@@ -410,11 +437,13 @@ describe("DurableObjectKvStorage", () => {
 		});
 
 		it("deletes existing incremental updates during commit", async () => {
-			storage.list.mockResolvedValue(
-				new Map([
-					["ydoc:update:1", new Uint8Array([1])],
-					["ydoc:update:2", new Uint8Array([2])],
-				]),
+			storage.list.mockImplementation(async (options?: { prefix?: string }) =>
+				options?.prefix === "ydoc:update:"
+					? new Map([
+							["ydoc:update:1", new Uint8Array([1])],
+							["ydoc:update:2", new Uint8Array([2])],
+						])
+					: new Map(),
 			);
 
 			const doc = new Doc();

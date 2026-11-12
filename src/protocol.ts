@@ -1,6 +1,6 @@
 /**
  * Length-prefixed message framing for streaming Yjs protocol messages
- * over TransformStream between Durable Objects.
+ * over a ReadableStream between Durable Objects.
  *
  * Each frame is encoded as:
  *   [4-byte big-endian length] [payload of that length]
@@ -15,10 +15,10 @@ const HEADER_SIZE = 4;
 /**
  * Default per-frame payload cap. This is a safety guard against a malformed or
  * hostile length header making the decoder allocate unbounded memory — **not** a
- * yjs or Durable Object limit. The full-document initial sync (`SyncStep2`) is a
- * single frame, so this caps the largest syncable document. Trusted DO-to-DO
- * deployments that sync large documents can raise it per-decoder via
- * {@link createFrameDecoder}'s `maxFrameSize` option.
+ * yjs or Durable Object limit. It does not bound document size: a message
+ * larger than one frame is split by {@link encodeMessage} and reassembled by
+ * {@link createMessageDecoder}. A decoder must accept frames at least as large
+ * as its sender produces (`maxFrameSize` on both sides).
  *
  * @default 1048576 (1 MB)
  */
