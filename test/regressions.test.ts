@@ -190,6 +190,28 @@ describe("echo suppression does not stall the originator's stream", () => {
 		expect(await sub.getText("theirs")).toBe("p");
 		await sub.disconnect();
 	});
+
+	it("delivers later updates to a subscriber after several of its own writes", async () => {
+		const provider = env.Y_STREAM_PROVIDER.get(env.Y_STREAM_PROVIDER.idFromName("echo-stall-multi"));
+		const sub = env.Y_STREAM_SUBSCRIBER.get(env.Y_STREAM_SUBSCRIBER.idFromName("echo-stall-multi-sub"));
+		await sub.connectToProvider("echo-stall-multi");
+		await waitFor(() => sub.getSynced());
+
+		for (const [index, char] of ["a", "b", "c"].entries()) {
+			await sub.insertText("mine", index, char);
+			await delay(30);
+		}
+		await waitFor(async () => {
+			const doc = new Doc();
+			applyUpdate(doc, await provider.getYDoc());
+			return doc.getText("mine").toString() === "abc";
+		});
+
+		await provider.applyUpdate(createTextUpdate("theirs", "p"));
+		await waitFor(async () => (await sub.getText("theirs")) === "p");
+		expect(await sub.getText("theirs")).toBe("p");
+		await sub.disconnect();
+	});
 });
 
 describe("disconnect() during a live stream", () => {

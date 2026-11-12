@@ -17,11 +17,16 @@ export interface YStreamProviderStub {
 	 * @param subscriptionId Optional id for this one stream, so
 	 *   {@link unsubscribe} can drop it without touching other streams that
 	 *   share `clientId`.
+	 * @param stateVector Optional Yjs state vector of the subscriber's document.
+	 *   When provided, the initial sync carries only what the subscriber lacks
+	 *   rather than the whole document. Providers older than this parameter
+	 *   ignore it and send full state.
 	 */
 	subscribe(
 		clientId?: string,
 		interest?: string[],
 		subscriptionId?: string,
+		stateVector?: Uint8Array,
 	): Promise<ReadableStream<Uint8Array>>;
 
 	/**
@@ -91,7 +96,9 @@ export interface ReconnectOptions {
 	maxRetries?: number;
 
 	/**
-	 * Initial delay in milliseconds before the first retry.
+	 * Initial delay in milliseconds before the first retry. Each actual
+	 * wait is a random 50–100% of the computed backoff, so subscribers that
+	 * lost the same provider do not all reconnect at the same instant.
 	 * @default 100
 	 */
 	initialDelay?: number;
@@ -137,9 +144,10 @@ export interface YStreamClientOptions {
 	reconnect?: boolean | ReconnectOptions;
 
 	/**
-	 * Maximum decodable frame payload, in bytes. The full-document initial
-	 * sync arrives as a single frame, so raise this above the 1 MB default to
-	 * sync larger documents. Must be ≥ the largest frame the provider sends.
+	 * Maximum decodable frame payload, in bytes. Must be ≥ the provider's
+	 * `frameChunkSize`; a larger frame ends the connection and is reported to
+	 * {@link onError}. Messages larger than one frame (such as a big initial
+	 * sync) arrive split across frames, so this does not bound document size.
 	 *
 	 * @default 1048576 (1 MB)
 	 */
@@ -156,10 +164,12 @@ export interface YStreamClientOptions {
 	interest?: string[];
 
 	/**
-	 * Called when a background send to the provider fails (a fire-and-forget
-	 * `stub.update` from the doc `update` handler or a SyncStep reply). Without
-	 * this hook such failures are logged; they never become unhandled promise
-	 * rejections. The failed update is not retried — the next SyncStep1/2
+	 * Called when the client hits an error it cannot return to a caller: a
+	 * failed `subscribe`, a fire-and-forget `stub.update` (from the doc
+	 * `update` handler or a SyncStep reply), or an undecodable frame or
+	 * message from the provider (which also ends that connection). Without
+	 * this hook such errors are logged; they never become unhandled promise
+	 * rejections. A failed update is not retried — the next SyncStep1/2
 	 * handshake (reconnect or `syncOnce`) recovers any missed state.
 	 */
 	onError?: (error: unknown) => void;
@@ -235,6 +245,15 @@ export interface YStreamProviderOptions {
 	 * @default 64
 	 */
 	streamHighWaterMark?: number;
+
+	/**
+	 * Maximum bytes of frames buffered per subscriber before the
+	 * backpressure policy is applied. Bounds memory when frames are large:
+	 * `streamHighWaterMark` alone allows 64 frames of up to `frameChunkSize`
+	 * (1 MB) each.
+	 * @default 16777216 (16 MB)
+	 */
+	streamHighWaterBytes?: number;
 
 	/**
 	 * Maximum size of each frame sent to subscribers, in bytes. The

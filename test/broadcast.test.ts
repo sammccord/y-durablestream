@@ -156,15 +156,24 @@ describe("BroadcastBuffer resync backpressure", () => {
 		// Force a resync.
 		for (let i = 1; i <= 10; i++) buf.push(frame(i));
 		await delay(20);
+		// Drain until the consumer is parked, keeping the still-pending read
+		// (a timed-out readUpTo would abandon one that swallows the next frame).
+		const drained: number[] = [];
+		let pending = reader.read();
+		for (;;) {
+			const result = await Promise.race([pending, delay(50).then(() => null)]);
+			if (result === null) break;
+			if (result.value) drained.push(result.value[0]);
+			pending = reader.read();
+		}
+		expect(drained).toContain(RESYNC);
 
-		// New frames pushed after the resync must still arrive.
+		// New frames pushed after the consumer has recovered must still arrive.
 		buf.push(frame(200));
 		buf.push(frame(201));
 
-		const received = await readUpTo(reader, 10);
-		expect(received).toContain(RESYNC);
-		expect(received).toContain(200);
-		expect(received).toContain(201);
+		const first = await pending;
+		expect([first.value?.[0], ...(await readUpTo(reader, 1))]).toEqual([200, 201]);
 	});
 });
 
@@ -419,5 +428,96 @@ describe("BroadcastBuffer removeByClientId", () => {
 		expect(buf.removeByClientId("a", "one-shot")).toBe(1);
 		expect(buf.removeByClientId("a", "one-shot")).toBe(0);
 		expect(buf.consumerCount).toBe(1);
+	});
+});
+
+// ──────────────────────────────────────────────────────────
+// A wake that delivers nothing must not stall the stream
+// ──────────────────────────────────────────────────────────
+
+describe("BroadcastBuffer parked consumer survives undeliverable wakes", () => {
+	it("delivers a foreign frame after several echo-suppressed frames", async () => {
+		const buf = new BroadcastBuffer();
+		const a = buf.createConsumer(undefined, "client-a");
+		const reader = a.readable.getReader();
+		const pending = reader.read();
+
+		for (const n of [1, 2, 3]) {
+			await delay(10);
+			buf.push(frame(n), { originId: "client-a" });
+		}
+		await delay(10);
+		buf.push(frame(9));
+
+		const result = await Promise.race([pending, delay(500).then(() => "timeout" as const)]);
+		expect(result).not.toBe("timeout");
+		expect(result).toMatchObject({ done: false, value: frame(9) });
+		expect(buf.bufferedFrameCount).toBe(0);
+	});
+
+	it("delivers a matching frame after several non-interest frames", async () => {
+		const buf = new BroadcastBuffer();
+		const a = buf.createConsumer(undefined, "client-a", ["wanted"]);
+		const reader = a.readable.getReader();
+		const pending = reader.read();
+
+		for (const n of [1, 2, 3]) {
+			await delay(10);
+			buf.push(frame(n), { key: "other" });
+		}
+		await delay(10);
+		buf.push(frame(9), { key: "wanted" });
+
+		const result = await Promise.race([pending, delay(500).then(() => "timeout" as const)]);
+		expect(result).toMatchObject({ done: false, value: frame(9) });
+	});
+
+	it("closes cleanly when removed while parked", async () => {
+		const buf = new BroadcastBuffer();
+		const a = buf.createConsumer(undefined, "client-a");
+		const reader = a.readable.getReader();
+		const pending = reader.read();
+		await delay(10);
+		buf.push(frame(1), { originId: "client-a" });
+		await delay(10);
+		a.cancel();
+		expect(await pending).toMatchObject({ done: true });
+	});
+});
+
+// ──────────────────────────────────────────────────────────
+// Backpressure by bytes
+// ──────────────────────────────────────────────────────────
+
+describe("BroadcastBuffer byte high-water mark", () => {
+	const RESYNC = 0xff;
+	const big = (n: number) => new Uint8Array(1_000).fill(n);
+
+	it("resyncs a consumer that is few frames but many bytes behind", async () => {
+		const buf = new BroadcastBuffer({
+			highWaterMark: 64,
+			highWaterBytes: 2_500,
+			onResync: () => [frame(RESYNC)],
+		});
+		const consumer = buf.createConsumer();
+		const reader = consumer.readable.getReader();
+
+		for (const n of [1, 2, 3, 4]) buf.push(big(n));
+
+		expect(buf.bufferedFrameCount).toBeLessThan(4);
+		expect(await readUpTo(reader, 1)).toEqual([RESYNC]);
+	});
+
+	it("does not treat a single oversized frame as lag", async () => {
+		const buf = new BroadcastBuffer({
+			highWaterBytes: 100,
+			onResync: () => [frame(RESYNC)],
+		});
+		const consumer = buf.createConsumer();
+		const reader = consumer.readable.getReader();
+
+		buf.push(big(7));
+
+		expect(await readUpTo(reader, 1)).toEqual([7]);
 	});
 });

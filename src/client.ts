@@ -1,13 +1,10 @@
 import { createDecoder, readVarUint } from "lib0/decoding";
-import {
-	createEncoder,
-	length,
-	toUint8Array,
-	writeVarUint,
-} from "lib0/encoding";
-import { readSyncMessage, writeSyncStep1, writeUpdate } from "y-protocols/sync";
+import { createEncoder, length, toUint8Array, writeVarUint } from "lib0/encoding";
+import { readSyncMessage } from "y-protocols/sync";
+import { encodeStateVector } from "yjs";
 
 import { createMessageDecoder } from "./protocol";
+import { MESSAGE_SYNC, SYNC_STEP_2, createSyncUpdateMessage, isEmptySyncStep2 } from "./sync";
 
 import type { Doc } from "yjs";
 import type {
@@ -17,9 +14,6 @@ import type {
 	YStreamClientStatus,
 	YStreamProviderStub,
 } from "./types";
-
-/** Yjs sync protocol outer message type identifier. */
-const MESSAGE_SYNC = 0;
 
 /**
  * Generate a globally unique id.  The workerd runtime provides a
@@ -31,13 +25,6 @@ function randomId(): string {
 		globalThis as unknown as { crypto: { randomUUID(): string } }
 	).crypto.randomUUID();
 }
-
-/**
- * y-protocols/sync messageYjsSyncStep2 constant.
- * After receiving and processing a SyncStep2, the client considers
- * itself fully synchronised with the provider.
- */
-const SYNC_STEP_2 = 1;
 
 /**
  * A client that synchronises a local `Y.Doc` with an upstream
@@ -57,9 +44,11 @@ const SYNC_STEP_2 = 1;
  * On connection the provider sends SyncStep1 + SyncStep2.  The client:
  *
  * - Processes **SyncStep1** — this produces a SyncStep2 reply (carrying
- *   any data the provider lacks), which is sent back via `stub.update()`.
- * - Processes **SyncStep2** — applies the full document state to the
- *   local doc and transitions to `"synced"` status.
+ *   any data the provider lacks), which is sent back via `stub.update()`
+ *   unless it is empty.
+ * - Processes **SyncStep2** — applies what the local doc lacks (the client
+ *   sends its state vector with `subscribe()`, so this is a diff) and
+ *   transitions to `"synced"` status.
  *
  * After initial sync, incremental updates flow in both directions:
  *
@@ -154,7 +143,7 @@ export class YStreamClient {
 	 */
 	private wakeReconnect: (() => void) | null = null;
 
-	/** Error hook for background send failures (see {@link YStreamClientOptions.onError}). */
+	/** Error hook for failures with no caller to return to (see {@link YStreamClientOptions.onError}). */
 	private readonly onError: (error: unknown) => void;
 
 	constructor(doc: Doc, options: YStreamClientOptions) {
@@ -165,7 +154,7 @@ export class YStreamClient {
 		this.interest = options.interest;
 		this.onError =
 			options.onError ??
-			((error) => console.error("[y-durablestream] send to provider failed:", error));
+			((error) => console.error("[y-durablestream] client error:", error));
 		const reconnect = options.reconnect;
 		const overrides = typeof reconnect === "object" ? reconnect : undefined;
 		this.reconnectOptions = reconnect
@@ -253,21 +242,17 @@ export class YStreamClient {
 		// connectOnce() was silently discarded.
 		this._disposed = false;
 
-		if (!this.reconnectOptions) {
-			return this.connectOnce();
-		}
-
-		// ── Reconnect loop ──────────────────────────────────────────
-		let attempt = 0;
+		// The status only returns to "disconnected" below, once the whole
+		// connect() call is over. Between attempts it goes straight to
+		// "reconnecting", so a listener (or caller) that reacts to
+		// "disconnected" by calling connect() cannot start a second loop
+		// alongside this one, and disconnect() is never mistaken for a no-op.
 		const opts = this.reconnectOptions;
+		let attempt = 0;
 
-		// eslint-disable-next-line no-constant-condition
-		while (true) {
+		for (;;) {
 			this.didSync = false;
 			await this.connectOnce();
-
-			// disconnect() was called — stop reconnecting.
-			if (this._disposed) return;
 
 			// If we successfully synced on this attempt, reset the
 			// retry counter so transient failures don't accumulate.
@@ -275,17 +260,19 @@ export class YStreamClient {
 				attempt = 0;
 			}
 
-			// Check retry budget.
-			if (attempt >= opts.maxRetries) return;
+			if (this._disposed || !opts || attempt >= opts.maxRetries) break;
 
 			// Wait with exponential backoff before the next attempt.
 			// disconnect() wakes this sleep early (and clears the timer) so
 			// the connect() promise doesn't stay pending for up to maxDelay.
 			this.setStatus("reconnecting");
-			const delay = Math.min(
+			const backoff = Math.min(
 				opts.initialDelay * Math.pow(opts.backoffMultiplier, attempt),
 				opts.maxDelay,
 			);
+			// Jitter: subscribers that lost the same provider would otherwise
+			// all reconnect (and each request a sync burst) at the same instant.
+			const delay = backoff * (0.5 + Math.random() / 2);
 			await new Promise<void>((resolve) => {
 				const timer = setTimeout(() => {
 					this.wakeReconnect = null;
@@ -299,20 +286,20 @@ export class YStreamClient {
 			});
 
 			// disconnect() may have been called while we were sleeping.
-			if (this._disposed) {
-				this.setStatus("disconnected");
-				return;
-			}
+			if (this._disposed) break;
 
 			attempt++;
 		}
+
+		this.setStatus("disconnected");
 	}
 
 	/**
-	 * Execute a single connect → read-loop → teardown cycle.
+	 * Execute a single connect → read-loop → cleanup cycle.
 	 *
 	 * Factored out of {@link connect} so the reconnect loop can
-	 * repeatedly invoke it.  Always resolves — never rejects.
+	 * repeatedly invoke it.  Always resolves — never rejects. Leaves the
+	 * final status transition to {@link connect}.
 	 */
 	private async connectOnce(): Promise<void> {
 		this.setStatus("connecting");
@@ -320,9 +307,14 @@ export class YStreamClient {
 		const subscriptionId = randomId();
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
-		} catch {
-			this.setStatus("disconnected");
+			stream = await this.stub.subscribe(
+				this.clientId,
+				this.interest,
+				subscriptionId,
+				encodeStateVector(this.doc),
+			);
+		} catch (error) {
+			this.onError(error);
 			return;
 		}
 
@@ -332,7 +324,6 @@ export class YStreamClient {
 		if (this._disposed) {
 			stream.cancel().catch(() => {});
 			await this.safeUnsubscribe(subscriptionId);
-			this.teardown();
 			return;
 		}
 
@@ -351,16 +342,15 @@ export class YStreamClient {
 				origin && typeof origin === "object"
 					? (origin as { key?: unknown }).key
 					: undefined;
-			this.sendUpdate(update, typeof key === "string" ? key : undefined);
+			this.pushLocalUpdate(update, typeof key === "string" ? key : undefined).catch(
+				this.onError,
+			);
 		};
 		this.doc.on("update", this.updateHandler);
 
-		// Send our own SyncStep1 to the provider so it knows what we
-		// already have.  The provider will respond with a SyncStep2 if
-		// we had data it was missing.  Fire-and-forget: a failure here is
-		// recovered by the next handshake, but must not become an
-		// unhandled rejection.
-		this.sendSyncStep1().catch(this.onError);
+		// No SyncStep1 is sent from here: the stream's opening burst already
+		// syncs both directions (the provider's SyncStep1 makes us push what it
+		// lacks; its SyncStep2 delivers what we lack, scoped to our interest).
 
 		// Enter the read loop — this runs until the stream ends or we
 		// disconnect.  readLoop() always resolves (never rejects).
@@ -372,12 +362,10 @@ export class YStreamClient {
 		// evicted. Awaited so a reconnect's fresh subscribe() cannot race it.
 		await this.safeUnsubscribe(subscriptionId);
 
-		// Clean up resources after the read loop exits.
-		// This is the ONLY place teardown is called during an active
-		// connection — disconnect() deliberately does NOT call it,
-		// avoiding the double-cleanup race that causes unhandled
-		// rejections.
-		this.teardown();
+		// Release the resources of this connection. disconnect() deliberately
+		// does NOT do this, avoiding the double-cleanup race that causes
+		// unhandled rejections.
+		this.cleanup();
 	}
 
 	/**
@@ -385,10 +373,10 @@ export class YStreamClient {
 	 *
 	 * Cancels the underlying `ReadableStream` reader, which causes the
 	 * read loop inside {@link connect} to exit.  The `connect()` method
-	 * then calls {@link teardown} to release all resources.
+	 * then releases all resources.
 	 *
-	 * This method intentionally does **not** call `teardown()` itself —
-	 * doing so would race with `connect()`'s teardown and create
+	 * This method intentionally does **not** release them itself —
+	 * doing so would race with `connect()`'s cleanup and create
 	 * duplicate `reader.cancel()` / `reader.releaseLock()` calls that
 	 * surface as unhandled promise rejections in the workerd runtime.
 	 *
@@ -405,7 +393,7 @@ export class YStreamClient {
 		this._disposed = true;
 
 		// Cancel through the read loop's reader: its pending read resolves
-		// as done, the loop exits, and connect() then calls teardown().
+		// as done, the loop exits, and connect() then cleans up.
 		this.reader?.cancel().catch(() => {});
 
 		// Wake a pending reconnect backoff sleep so the connect() loop can
@@ -434,8 +422,16 @@ export class YStreamClient {
 			while (!this._disposed) {
 				const { done, value } = await reader.read();
 				if (done) break;
-				for (const msg of decoder.push(value)) {
-					this.handleMessage(msg);
+				try {
+					for (const msg of decoder.push(value)) {
+						this.handleMessage(msg);
+					}
+				} catch (error) {
+					// An undecodable frame or message: the stream can no longer
+					// be trusted. Report it and end this connection.
+					this.onError(error);
+					reader.cancel().catch(() => {});
+					break;
 				}
 			}
 		} catch {
@@ -491,7 +487,9 @@ export class YStreamClient {
 
 		writeVarUint(encoder, MESSAGE_SYNC);
 		const syncType = readSyncMessage(msgDecoder, encoder, this.doc, this);
-		return { syncType, reply: length(encoder) > 1 ? toUint8Array(encoder) : null };
+		const reply = length(encoder) > 1 ? toUint8Array(encoder) : null;
+		// A reply carrying nothing the provider lacks is not worth an RPC.
+		return { syncType, reply: reply && isEmptySyncStep2(reply) ? null : reply };
 	}
 
 	/**
@@ -508,19 +506,29 @@ export class YStreamClient {
 	 *
 	 * Leaves {@link status}/{@link synced} untouched (it is not a persistent
 	 * connection). Always resolves; never rejects.
+	 *
+	 * @returns `true` once both halves completed; `false` if the provider was
+	 *   unreachable, the stream ended early, or a message failed to decode or
+	 *   send (the error goes to {@link YStreamClientOptions.onError}).
 	 */
-	async syncOnce(): Promise<void> {
+	async syncOnce(): Promise<boolean> {
 		const subscriptionId = randomId();
 		let stream: ReadableStream<Uint8Array>;
 		try {
-			stream = await this.stub.subscribe(this.clientId, this.interest, subscriptionId);
-		} catch {
-			return;
+			stream = await this.stub.subscribe(
+				this.clientId,
+				this.interest,
+				subscriptionId,
+				encodeStateVector(this.doc),
+			);
+		} catch (error) {
+			this.onError(error);
+			return false;
 		}
 
 		const decoder = createMessageDecoder({ maxFrameSize: this.maxFrameSize });
+		let done = false;
 		try {
-			let done = false;
 			for await (const chunk of stream) {
 				for (const msg of decoder.push(chunk)) {
 					const { syncType, reply } = this.decodeSyncMessage(msg);
@@ -533,8 +541,9 @@ export class YStreamClient {
 				}
 				if (done) break;
 			}
-		} catch {
-			// stream error / cancellation — best-effort one-shot
+		} catch (error) {
+			this.onError(error);
+			done = false;
 		} finally {
 			// Breaking out of `for await` cancels the stream iterator locally,
 			// but the cancel does not reach the provider across the RPC
@@ -542,6 +551,7 @@ export class YStreamClient {
 			await this.safeUnsubscribe(subscriptionId);
 			decoder.reset();
 		}
+		return done;
 	}
 
 	/**
@@ -564,36 +574,6 @@ export class YStreamClient {
 	// ═════════════════════════════════════
 
 	/**
-	 * Send a SyncStep1 message to the provider.
-	 * This tells the provider our state vector so it can determine
-	 * whether there is any data we already have that it lacks.
-	 *
-	 * The provider may respond with a SyncStep2 carrying data that
-	 * the client has but the provider lacked — completing the
-	 * bidirectional sync protocol.
-	 */
-	private async sendSyncStep1(): Promise<void> {
-		const encoder = createEncoder();
-		writeVarUint(encoder, MESSAGE_SYNC);
-		writeSyncStep1(encoder, this.doc);
-		const response = await this.stub.update(toUint8Array(encoder), this.clientId);
-		if (response) {
-			this.handleMessage(response);
-		}
-	}
-
-	/**
-	 * Wrap a raw Yjs doc update in a sync Update message and send it
-	 * to the provider, tagged with an optional interest routing `key`.
-	 */
-	private sendUpdate(update: Uint8Array, key?: string): void {
-		const encoder = createEncoder();
-		writeVarUint(encoder, MESSAGE_SYNC);
-		writeUpdate(encoder, update);
-		this.stub.update(toUint8Array(encoder), this.clientId, key).catch(this.onError);
-	}
-
-	/**
 	 * Forward a local Yjs doc update to the provider, tagged with this client's
 	 * `clientId` (so it is not echoed back to this client) and an optional
 	 * interest routing `key`. Public counterpart to the stream-mode update
@@ -602,10 +582,7 @@ export class YStreamClient {
 	 * Awaits the provider RPC so the caller can tie it to a request via `waitUntil`.
 	 */
 	async pushLocalUpdate(update: Uint8Array, key?: string): Promise<void> {
-		const encoder = createEncoder();
-		writeVarUint(encoder, MESSAGE_SYNC);
-		writeUpdate(encoder, update);
-		await this.stub.update(toUint8Array(encoder), this.clientId, key);
+		await this.stub.update(createSyncUpdateMessage(update), this.clientId, key);
 	}
 
 	// ═════════════════════════════════════
@@ -613,16 +590,14 @@ export class YStreamClient {
 	// ═════════════════════════════════════
 
 	/**
-	 * Release all resources.  Called exclusively by {@link connect}
-	 * after the read loop exits — never by {@link disconnect}.
+	 * Release the resources of one connection.  Called exclusively by
+	 * {@link connectOnce} after the read loop exits — never by
+	 * {@link disconnect}.
 	 *
-	 * Does **not** cancel the reader (that is disconnect's job).
-	 * Only cleans up references so the client can be reconnected or
-	 * garbage-collected.
-	 *
-	 * Idempotent — safe to call repeatedly.
+	 * Does **not** cancel the reader (that is disconnect's job) and does not
+	 * touch the status ({@link connect} owns that transition).
 	 */
-	private teardown(): void {
+	private cleanup(): void {
 		if (this.updateHandler) {
 			this.doc.off("update", this.updateHandler);
 			this.updateHandler = null;
@@ -636,7 +611,6 @@ export class YStreamClient {
 		}
 
 		this._synced = false;
-		this.setStatus("disconnected");
 	}
 
 	/**

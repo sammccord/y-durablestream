@@ -4,11 +4,11 @@
 [![CI](https://github.com/sammccord/y-durablestream/actions/workflows/ci.yml/badge.svg)](https://github.com/sammccord/y-durablestream/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Yjs document synchronization between Cloudflare Durable Objects via `TransformStream`.
+Yjs document synchronization between Cloudflare Durable Objects via `ReadableStream`.
 
 ## Overview
 
-`y-durablestream` enables Durable Object-to-Durable Object Yjs document synchronization using the Cloudflare `TransformStream` API. An upstream **provider** Durable Object hosts the authoritative document and streams updates to any number of downstream **subscriber** Durable Objects over `ReadableStream`. Subscribers push local changes back via direct RPC.
+`y-durablestream` enables Durable Object-to-Durable Object Yjs document synchronization over RPC-returned streams. An upstream **provider** Durable Object hosts the authoritative document and streams updates to any number of downstream **subscriber** Durable Objects over `ReadableStream`. Subscribers push local changes back via direct RPC.
 
 ```
 ┌──────────────────────┐                                ┌──────────────────────┐
@@ -215,18 +215,22 @@ Default backend using the Durable Object async KV API (`ctx.storage.get/put/list
 import { DurableObjectKvStorage } from "y-durablestream";
 
 const storage = new DurableObjectKvStorage(ctx.storage, {
-  maxBytes: 10 * 1024,  // optional, default 10KB
-  maxUpdates: 500,       // optional, default 500
+  maxBytes: 10 * 1024,       // optional, default 10KB
+  maxUpdates: 500,           // optional, default 500
+  snapshotGrowthRatio: 0.25, // optional, default 0.25
 });
 ```
+
+Updates are compacted into the snapshot once they exceed `maxUpdates`, or their bytes exceed `max(maxBytes, snapshot size × snapshotGrowthRatio)`. The ratio keeps a large document from rewriting its whole snapshot for every few KB of edits; set it to `0` for a fixed `maxBytes` threshold. Both backends take the same options.
 
 Storage layout:
 
 | KV Key | Value |
 |---|---|
-| `ydoc:state:doc` | Compacted snapshot (`Uint8Array`) |
-| `ydoc:state:bytes` | Total incremental bytes (`number`) |
-| `ydoc:state:count` | Incremental update count (`number`) |
+| `ydoc:state:doc` | Compacted snapshot, first 96 KB (`Uint8Array`) |
+| `ydoc:state:doc:<n>` | Snapshot chunk n ≥ 1, for snapshots over 96 KB (`Uint8Array`) |
+| `ydoc:state:meta` | `{ bytes, count }` of incremental updates |
+| `ydoc:state:snapshot-bytes` | Snapshot byte length (`number`) |
 | `ydoc:update:<n>` | Incremental update n (`Uint8Array`) |
 
 > `maxBytes` must not exceed 128 KB (the Durable Object KV per-value limit).
@@ -239,8 +243,9 @@ Alternative backend using the Durable Object synchronous SQLite API (`ctx.storag
 import { DurableObjectSqlStorage } from "y-durablestream";
 
 const storage = new DurableObjectSqlStorage(ctx.storage, {
-  maxBytes: 10 * 1024,  // optional, default 10KB
-  maxUpdates: 500,       // optional, default 500
+  maxBytes: 10 * 1024,       // optional, default 10KB
+  maxUpdates: 500,           // optional, default 500
+  snapshotGrowthRatio: 0.25, // optional, default 0.25
 });
 ```
 
@@ -254,8 +259,9 @@ SQL tables created automatically:
 
 | Table | Columns | Description |
 |---|---|---|
-| `yjs_snapshot` | `id INTEGER PK, data BLOB` | Single-row compacted snapshot |
-| `yjs_updates` | `id INTEGER PK AUTOINCREMENT, data BLOB, byte_length INTEGER` | Incremental updates |
+| `yjs_snapshot` | `id INTEGER PK, data BLOB` | Single-row compacted snapshot (first 1 MB) |
+| `yjs_snapshot_chunks` | `idx INTEGER PK, data BLOB` | Remaining 1 MB chunks of a larger snapshot |
+| `yjs_updates` | `id INTEGER PK, data BLOB, byte_length INTEGER` | Incremental updates |
 
 > Requires a SQLite-backed Durable Object (`new_sqlite_classes` in `wrangler.toml`).
 
@@ -272,9 +278,15 @@ class MyCustomStorage implements YDocStorage {
     // Load and return a Doc with all persisted state
   }
 
-  async storeUpdate(update: Uint8Array): Promise<void> {
-    // Persist an incremental update, auto-compact when thresholds exceeded
+  async storeUpdate(update: Uint8Array, doc?: Doc): Promise<void> {
+    // Persist an incremental update, auto-compact when thresholds exceeded.
+    // `doc` is the live document (already containing `update`); snapshot it
+    // on compaction instead of reading stored state back.
   }
+
+  // Optional: apply persisted state straight to the provider's document at
+  // startup, skipping the intermediate Doc that getYDoc() builds.
+  async loadInto(doc: Doc): Promise<void> {}
 
   async commit(doc: Doc): Promise<void> {
     // Force-compact all updates into a single snapshot using the given doc
@@ -286,7 +298,7 @@ class MyCustomStorage implements YDocStorage {
 
 ### Protocol Utilities
 
-Low-level framing utilities for the length-prefixed message protocol used over `TransformStream`. You only need these if building custom transport layers.
+Low-level framing utilities for the length-prefixed message protocol used over the subscriber stream. You only need these if building custom transport layers.
 
 ```typescript
 import { encodeFrame, encodeFrames, createFrameDecoder, FrameDecodeError } from "y-durablestream";
@@ -303,20 +315,20 @@ import { encodeFrame, encodeFrames, createFrameDecoder, FrameDecodeError } from 
 
 ### Connection Flow
 
-1. Subscriber calls `provider.subscribe()` via RPC
-2. Provider creates a `TransformStream`, registers the writable side, returns the `ReadableStream`
-3. Provider asynchronously writes **SyncStep1** + **SyncStep2** to bootstrap the subscriber with full document state
-4. Subscriber processes the initial sync burst, transitions to `"synced"` status
-5. Subscriber sends its own **SyncStep1** back via `provider.update()` so the provider can learn about any state it's missing
+1. Subscriber calls `provider.subscribe()` via RPC, passing its document's state vector
+2. Provider registers a consumer on its shared broadcast buffer and returns that consumer's pull-based `ReadableStream`
+3. The stream opens with **SyncStep1** (the provider's state vector) + **SyncStep2** (what the subscriber lacks, split across frames when large)
+4. Subscriber applies the burst and transitions to `"synced"` status
+5. Subscriber answers the provider's SyncStep1 via `provider.update()` with any state the provider is missing (skipped when there is none)
 
 ### Steady-State Updates
 
-- **Provider → Subscriber**: when the provider's doc changes (via `applyUpdate()` or from another subscriber), the update is wrapped in a sync Update message, length-framed, and written to every active subscriber stream
+- **Provider → Subscriber**: when the provider's doc changes (via `applyUpdate()` or from another subscriber), the update is wrapped in a sync Update message, length-framed, and pushed to the broadcast buffer, from which every active subscriber stream pulls it
 - **Subscriber → Provider**: when the subscriber's local doc changes, the update is wrapped in a sync Update message and sent via `provider.update()` RPC
 
 ### Persistence
 
-Updates are stored incrementally. When the cumulative byte size or count exceeds configurable thresholds, all incremental updates are compacted into a single snapshot. Compaction also runs automatically when the last subscriber disconnects.
+Updates are stored incrementally. When the cumulative byte size or count exceeds configurable thresholds, all incremental updates are compacted into a single snapshot. Compaction also runs automatically when the last subscriber disconnects. Snapshots larger than one storage value are split across values, so document size is not capped by the per-value limit. Storage never garbage-collects on its own, so a provider created with `gc: false` keeps its full history across restarts.
 
 ### Why Length-Prefixed Framing?
 

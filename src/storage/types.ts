@@ -1,4 +1,4 @@
-import type { Doc } from "yjs";
+import { Doc } from "yjs";
 
 /**
  * Abstract storage backend for persisting Yjs document state.
@@ -37,8 +37,21 @@ export interface YDocStorage {
 	 *
 	 * @param update - A raw Yjs encoded update (from `doc.on('update')`
 	 *   or `Y.encodeStateAsUpdate`).
+	 * @param doc - The live document, already containing `update`. When
+	 *   given, a compaction snapshots it directly instead of reading the
+	 *   stored snapshot and updates back and replaying them. The provider
+	 *   always passes it.
 	 */
-	storeUpdate(update: Uint8Array): Promise<void>;
+	storeUpdate(update: Uint8Array, doc?: Doc): Promise<void>;
+
+	/**
+	 * Apply all persisted state directly to `doc`.
+	 *
+	 * Optional. When implemented, the provider loads through it at startup
+	 * rather than {@link getYDoc}, which builds a second document only to
+	 * re-encode it.
+	 */
+	loadInto?(doc: Doc): Promise<void>;
 
 	/**
 	 * Force-compact all incremental updates into a single snapshot.
@@ -77,6 +90,18 @@ export interface YDocStorageOptions {
 	 * @default 500
 	 */
 	maxUpdates?: number;
+
+	/**
+	 * Lets the byte threshold grow with the document: updates are compacted
+	 * once their bytes exceed `max(maxBytes, snapshotBytes × ratio)`. Each
+	 * compaction rewrites the whole snapshot, so a fixed `maxBytes` makes a
+	 * large document rewrite itself for every few KB of edits; with the
+	 * ratio, bytes written stay proportional to bytes edited. `0` disables
+	 * scaling. `maxUpdates` still applies unchanged.
+	 *
+	 * @default 0.25
+	 */
+	snapshotGrowthRatio?: number;
 }
 
 /**
@@ -88,3 +113,48 @@ export const DEFAULT_MAX_BYTES = 10 * 1024;
  * Default compaction threshold: 500 incremental updates.
  */
 export const DEFAULT_MAX_UPDATES = 500;
+
+/**
+ * Default {@link YDocStorageOptions.snapshotGrowthRatio}.
+ */
+export const DEFAULT_SNAPSHOT_GROWTH_RATIO = 0.25;
+
+/**
+ * Split `data` into consecutive chunks of at most `chunkBytes` each. Data
+ * that fits is returned as-is in a single chunk. Otherwise each chunk is a
+ * copy, not a view: structured-clone storage serializes a view's entire
+ * backing buffer, which would defeat the split.
+ */
+export function splitIntoChunks(data: Uint8Array, chunkBytes: number): Uint8Array[] {
+	if (data.byteLength <= chunkBytes) return [data];
+	const chunks: Uint8Array[] = [];
+	for (let offset = 0; offset < data.byteLength; offset += chunkBytes) {
+		chunks.push(data.slice(offset, offset + chunkBytes));
+	}
+	return chunks;
+}
+
+/** Concatenate chunks produced by {@link splitIntoChunks} back into one buffer. */
+export function joinChunks(chunks: Uint8Array[]): Uint8Array {
+	if (chunks.length === 1) return chunks[0];
+	let length = 0;
+	for (const chunk of chunks) length += chunk.byteLength;
+	const out = new Uint8Array(length);
+	let offset = 0;
+	for (const chunk of chunks) {
+		out.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return out;
+}
+
+/**
+ * Create the scratch document a storage backend rebuilds persisted state
+ * into. Garbage collection is off: this document only carries bytes between
+ * storage and the provider, and collecting here would strip deleted content
+ * that a `gc: false` provider must keep. A `gc: true` provider still
+ * collects when it applies the state to its own document.
+ */
+export function createCarrierDoc(): Doc {
+	return new Doc({ gc: false });
+}
